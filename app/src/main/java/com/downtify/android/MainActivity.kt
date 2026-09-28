@@ -3,7 +3,7 @@ package com.downtify.android
 import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.os.Bundle
-import android.view.ViewGroup
+import android.net.Uri
 import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -28,8 +28,6 @@ class MainActivity : AppCompatActivity() {
     private data class ServerConnection(val id: String, val token: String, val name: String, val legacyWeb: Boolean = false)
     private lateinit var config: ServerConfig
     private lateinit var web: WebView
-    private lateinit var root: LinearLayout
-    private lateinit var status: TextView
     private var pendingServerUrl = ""
     private var pendingPairCode = ""
 
@@ -37,19 +35,16 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         config = ServerConfig(this)
-        root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xff101010.toInt()) }
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(10, 8, 10, 8) }
-        status = TextView(this).apply { text = "Downtify"; setTextColor(-1); textSize = 18f; gravity = android.view.Gravity.CENTER_VERTICAL }
-        bar.addView(status, LinearLayout.LayoutParams(0, 48, 1f))
-        bar.addView(button("Offline") { showOffline() })
-        bar.addView(button("Server") { showConnect() })
-        root.addView(bar)
         val assetLoader = WebViewAssetLoader.Builder().addPathHandler("/", WebViewAssetLoader.AssetsPathHandler(this)).build()
         web = WebView(this).apply {
             settings.javaScriptEnabled = true; settings.domStorageEnabled = true; settings.mediaPlaybackRequiresUserGesture = false
             addJavascriptInterface(NativeBridge(this@MainActivity), "DowntifyNative")
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+                override fun onPageFinished(view: WebView, url: String) {
+                    super.onPageFinished(view, url)
+                    installNativeMenu(view)
+                }
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val uri = request.url
                     val appAssets = uri.host == "appassets.androidplatform.net"
@@ -65,12 +60,57 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+            setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                queueOfflineDownload(url, userAgent, contentDisposition, mimeType)
+            }
         }
-        root.addView(web, LinearLayout.LayoutParams(-1, 0, 1f)); setContentView(root)
+        setContentView(web)
         if (config.url.isNotBlank()) loadWeb() else showConnect()
     }
 
-    private fun button(text: String, action: () -> Unit) = Button(this).apply { this.text = text; setOnClickListener { action() } }
+    private fun installNativeMenu(view: WebView) {
+        view.evaluateJavascript(
+            """
+            (() => {
+              if (window.__downtifyAndroidMenuInstalled) return;
+              window.__downtifyAndroidMenuInstalled = true;
+              const addItems = () => {
+                for (const overlay of document.querySelectorAll('div.fixed.inset-0.items-end')) {
+                  const panel = overlay.firstElementChild;
+                  if (!panel || panel.querySelector('[data-downtify-android]')) continue;
+                  const make = (label, action) => {
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.dataset.downtifyAndroid = action;
+                    button.className = 'flex h-14 w-full items-center gap-4 rounded-control px-2 text-[15px] font-medium';
+                    button.innerHTML = `<span class="flex size-9 items-center justify-center rounded-[10px] bg-surface-2 text-fg-3">${'$'}{action === 'offline' ? '↓' : '⚙'}</span>${'$'}{label}`;
+                    button.addEventListener('click', () => action === 'offline' ? DowntifyNative.openOffline() : DowntifyNative.openServer());
+                    return button;
+                  };
+                  panel.append(make('Offline music', 'offline'), make('Android server settings', 'server'));
+                }
+              };
+              new MutationObserver(addItems).observe(document.body, { childList: true, subtree: true });
+              addItems();
+            })();
+            """.trimIndent(), null
+        )
+    }
+
+    private fun queueOfflineDownload(url: String, userAgent: String?, contentDisposition: String?, mimeType: String?) {
+        val server = runCatching { Uri.parse(config.url) }.getOrNull()
+        val target = runCatching { Uri.parse(url) }.getOrNull()
+        val sameServer = server != null && target != null && target.scheme == server.scheme && target.host == server.host && target.port == server.port
+        val mediaPath = target?.path?.startsWith("/downloads/") == true || target?.path?.startsWith("/media/") == true
+        if (!sameServer || !mediaPath) {
+            Toast.makeText(this, "Only Downtify library tracks can be saved offline.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val suggested = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        val cookies = CookieManager.getInstance().getCookie(url).orEmpty()
+        TrackDownloadWorker.enqueueDirect(this, url, config.serverId, suggested, userAgent.orEmpty(), cookies)
+        Toast.makeText(this, "Saving “${suggested.substringBeforeLast('.')}” for offline playback…", Toast.LENGTH_LONG).show()
+    }
     private fun showConnect(error: String? = null) {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 8, 32, 0) }
         val server = EditText(this).apply { hint = "https://music.example.com"; setSingleLine(); setText(config.url.ifBlank { pendingServerUrl }) }
@@ -88,7 +128,6 @@ class MainActivity : AppCompatActivity() {
         if (parsed == null || parsed.protocol !in listOf("https", "http") || (parsed.protocol == "http" && parsed.host !in listOf("localhost", "127.0.0.1", "10.0.2.2") && !parsed.host.startsWith("192.168."))) {
             showConnect("Enter the Downtify server's root HTTPS URL. HTTP is accepted for localhost and 192.168.x.x addresses."); return
         }
-        status.text = "Connecting…"
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching {
                 val client = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build()
@@ -129,8 +168,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 ServerConnection(serverId, token, serverInfo.optString("name", "Downtify"))
             } }
-            result.onSuccess { connection -> config.url = normalized; config.serverId = connection.id; config.token = connection.token; config.legacyWeb = connection.legacyWeb; pendingServerUrl = ""; pendingPairCode = ""; status.text = connection.name; loadWeb(); if (connection.legacyWeb) Toast.makeText(this@MainActivity,"Connected in web mode. Update Downtify to 3.2.0+ for native pairing and offline playback.",Toast.LENGTH_LONG).show() }
-                .onFailure { status.text = "Downtify"; showConnect(it.message ?: "Couldn't reach this server. Check the address and network, then try again.") }
+            result.onSuccess { connection -> config.url = normalized; config.serverId = connection.id; config.token = connection.token; config.legacyWeb = connection.legacyWeb; pendingServerUrl = ""; pendingPairCode = ""; loadWeb() }
+                .onFailure { showConnect(it.message ?: "Couldn't reach this server. Check the address and network, then try again.") }
         }
     }
     private fun httpError(operation: String, code: Int, body: String, contentType: String?): String {
@@ -154,7 +193,6 @@ class MainActivity : AppCompatActivity() {
         return true
     }
     private fun loadWeb() {
-        status.text = if (config.legacyWeb) "Downtify · web mode" else "Downtify"
         if (config.legacyWeb) web.loadUrl(config.url) else web.loadUrl("https://appassets.androidplatform.net/index.html")
     }
     private fun showOffline() {
@@ -179,6 +217,8 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun getServerUrl() = config.url
         @JavascriptInterface fun getToken() = if (config.legacyWeb) "" else config.token
         @JavascriptInterface fun supportsNativePlayback() = !config.legacyWeb
+        @JavascriptInterface fun openOffline() = runOnUiThread { showOffline() }
+        @JavascriptInterface fun openServer() = runOnUiThread { showConnect() }
         @JavascriptInterface fun setServerUrl(url: String) { runOnUiThread { showConnect() } }
         @JavascriptInterface fun downloadTrack(trackJson: String) {
             val t = runCatching { JSONObject(trackJson) }.getOrNull() ?: return
