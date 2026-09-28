@@ -1,0 +1,19 @@
+# Downtify Android implementation handoff
+
+## Purpose and source
+
+Standalone Android client repository at `C:/Projects/downtify-android`. Upstream Downtify was inspected at revision `d0eec48` (`henriquesebastiao/downtify`, GPL-3.0). It is a Vue 3/Vite frontend with a FastAPI server. Its mobile contract supports server discovery/info, device pairing, bearer tokens, track-ID library reads, range stream/download, and WebSockets.
+
+## Completed
+
+- Added native Android app scaffolding with Kotlin, Media3 playback service and queue, Room metadata, WorkManager track downloads, Keystore-backed encrypted preferences, offline actions in the existing UI, and generated web asset bundle served with WebViewAssetLoader.
+- Added setup/pairing using `/api/server/info` and `/api/auth/pair`; track IDs are resolved from `/api/v1/library` because upstream web rows use filenames.
+- Added Offline browser/settings, Wi-Fi-only preference, quality choice, storage clear action, build docs/script, and GPL-3 license.
+- Frontend `npm ci` and production build succeeded. `assembleDebug assembleRelease` succeeded on 2026-09-28 using JDK 17, Android SDK 35, Gradle 8.9. APKs: debug 9,371,921 bytes and release 7,402,295 bytes. `aapt dump badging` confirmed package `com.downtify.android`, min SDK 26, target SDK 35; APK listing confirmed bundled `assets/index.html` and JS.
+
+## Current constraints / next work
+
+- No device or emulator playback validation was performed; verification covers frontend production build and Gradle APK assembly only.
+- Library incremental sync, artwork download/cache, saved playback-position updates, persisted progress/status and retry presentation, foreground long-running download behavior, and fuller Offline browsing need implementation.
+- Rebuild embedded web assets after frontend edits: `npm --prefix web/frontend ci`, `npm --prefix web/frontend run build`, `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-web.ps1`; then `gradlew.bat --no-daemon assembleDebug assembleRelease`.
+- Release signing uses the debug signing config and must be changed before publishing.

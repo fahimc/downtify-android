@@ -1,0 +1,1784 @@
+"""Download a track from YouTube and tag it with the chosen metadata."""
+
+from __future__ import annotations
+
+import base64
+import os
+import re
+import re as _re
+import shutil
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+import httpx
+import yt_dlp
+from loguru import logger
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import (
+    APIC,
+    ID3,
+    TALB,
+    TCON,
+    TDRC,
+    TIT2,
+    TPE1,
+    TPE2,
+    TPOS,
+    TRCK,
+    TXXX,
+    USLT,
+)
+from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
+from mutagen.oggopus import OggOpus
+from mutagen.oggvorbis import OggVorbis
+from yt_dlp.postprocessor.ffmpeg import FFmpegExtractAudioPP
+
+from . import lyrics as lyrics_mod
+from . import spotify as spotify_mod
+from .cookies import CookiesStore
+from .file_naming import sanitize_file_name
+from .itunes import fetch_genre as _fetch_itunes_genre
+from .library_paths import library_stored_path, slskd_dir_from_downloader
+from .m3u import sanitize_playlist_name
+from .providers import (
+    enrich_from_match,
+    find_match,
+    find_match_for_video,
+    find_match_youtube_only,
+)
+from .slskd_provider import download_from_slskd
+
+# Extensions that count as "this song is already downloaded". Deliberately
+# excludes sidecars written next to the audio (.lrc, cover.jpg, .m3u) so a
+# leftover lyrics file can never stand in for a missing track.
+_AUDIO_EXTENSIONS = frozenset({'mp3', 'flac', 'ogg', 'opus', 'm4a'})
+
+# ``(percent, message, provider)`` — ``provider`` is the audio source
+# handling the download (``'slskd'``, ``'youtube-music'``, ``'youtube'``),
+# shown next to each queue row.
+ProgressCallback = Callable[[float, str, Optional[str]], None]
+
+AUDIO_PROVIDERS = ('youtube-music', 'youtube', 'slskd')
+
+
+class NoAudioMatchError(RuntimeError):
+    """No enabled audio provider found a source for the song."""
+
+
+# Upper bound of the "Parallel downloads" setting (see api.py's clamp).
+MAX_PARALLEL_DOWNLOADS = 30
+
+# A download holds a thread for its whole run (yt-dlp + ffmpeg, often
+# minutes). Running them on asyncio's default executor — only
+# min(32, cpu_count + 4) threads, e.g. 6 on a 2-core NAS — silently capped
+# "Parallel downloads" below the chosen value and left every
+# `asyncio.to_thread()` call (M3U writes, Monitor DB queries, playlist
+# fetches) queued behind in-flight downloads. Idle threads are cheap; the
+# download semaphore still bounds how many actually run. The extra room
+# covers Playlist Monitor sweeps, which download outside that semaphore.
+DOWNLOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=MAX_PARALLEL_DOWNLOADS + 8,
+    thread_name_prefix='downtify-download',
+)
+
+# Downtify format name → yt-dlp ExtractAudio codec name. yt-dlp calls Ogg
+# Vorbis "vorbis" (output extension .ogg); passing "ogg" crashes the
+# conversion with KeyError: 'ogg'.
+_YTDLP_AUDIO_CODECS = {'ogg': 'vorbis'}
+
+# yt-dlp codec → the source codec it stream-copies instead of encoding.
+_COPYABLE_SOURCE_CODECS = {'m4a': 'aac', 'opus': 'opus', 'vorbis': 'vorbis'}
+
+# A same-codec source within this fraction of the chosen bitrate is kept
+# as a lossless stream copy rather than re-encoded to the same bitrate.
+_BITRATE_COPY_TOLERANCE = 0.1
+
+
+def _audio_bit_rate(metadata: dict[str, Any]) -> Optional[float]:
+    """Audio bitrate (bits/s) from an ``ffprobe -show_streams -show_format``
+    JSON object, or ``None`` when it can't be told.
+
+    The audio stream's own ``bit_rate`` wins. WebM/Ogg streams don't carry
+    one, so the container's ``bit_rate`` is used instead — but only for an
+    audio-only file, where it isn't inflated by a video stream.
+    """
+
+    streams = metadata.get('streams') or []
+    audio = [s for s in streams if s.get('codec_type') == 'audio']
+    if not audio:
+        return None
+    for value in (
+        audio[0].get('bit_rate'),
+        (metadata.get('format') or {}).get('bit_rate')
+        if len(audio) == len(streams)
+        else None,
+    ):
+        try:
+            if value is not None and float(value) > 0:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+class _ExtractAudioPP(FFmpegExtractAudioPP):
+    """yt-dlp's audio extraction, honoring the chosen bitrate.
+
+    yt-dlp stream-copies instead of encoding whenever the downloaded
+    stream already has the target codec (an AAC source for M4A, Opus for
+    OPUS), silently ignoring ``preferredquality``. YouTube's AAC stream is
+    ~128 kbps, so M4A came out at 128 kbps whatever bitrate was chosen.
+
+    The copy is kept only when the source is already at the chosen bitrate
+    (within :data:`_BITRATE_COPY_TOLERANCE`) or its bitrate is unknown.
+    Otherwise the source codec is reported under a non-matching name, which
+    sends yt-dlp's ``run()`` down its regular encode path — same encoder
+    choice, bitrate arguments and temp-file handling as any other format.
+    """
+
+    def __init__(
+        self, downloader: Any, audio_format: str, bitrate_kbps: str
+    ) -> None:
+        self._codec = _YTDLP_AUDIO_CODECS.get(audio_format, audio_format)
+        super().__init__(
+            downloader,
+            preferredcodec=self._codec,
+            preferredquality=bitrate_kbps,
+        )
+        try:
+            self._bitrate_bps = float(bitrate_kbps) * 1000
+        except (TypeError, ValueError):
+            self._bitrate_bps = None
+
+    def get_audio_codec(self, path: str) -> Optional[str]:
+        codec = super().get_audio_codec(path)
+        if (
+            not self._bitrate_bps
+            or codec is None
+            or codec != _COPYABLE_SOURCE_CODECS.get(self._codec)
+        ):
+            return codec
+        try:
+            source_bps = _audio_bit_rate(self.get_metadata_object(path))
+        except Exception:
+            logger.opt(exception=True).debug('ffprobe bitrate read failed')
+            return codec
+        if source_bps is None or (
+            abs(source_bps - self._bitrate_bps)
+            <= self._bitrate_bps * _BITRATE_COPY_TOLERANCE
+        ):
+            return codec
+        logger.info(
+            'Re-encoding {} source at {:.0f} kbps to {:.0f} kbps {}',
+            codec,
+            source_bps / 1000,
+            self._bitrate_bps / 1000,
+            self._codec,
+        )
+        return f'{codec}-reencode'
+
+
+def _sanitize(text: str) -> str:
+    return sanitize_file_name(text)
+
+
+# Order matters — yt-dlp tries clients top-to-bottom and uses the first one
+# that yields usable formats. `ios` and `android` lead because they still
+# provide audio formats in containers without a JS runtime, even though
+# YouTube now requires a GVS PO Token for their HTTPS/HLS formats (those
+# are skipped with a warning, but lower-quality streams remain available).
+# `web_embedded` and `web` need a JS runtime for signature/n-challenge
+# solving; without one, they yield no audio at all — so they're kept as
+# last-resort fallbacks only. `mweb` and `tv` are included as hail-mary
+# clients: `mweb` needs a PO Token too, and `tv` is affected by a DRM
+# experiment (yt-dlp #12563), but including them costs nothing.
+_DEFAULT_YT_PLAYER_CLIENTS = (
+    'ios',
+    'android',
+    'web_embedded',
+    'mweb',
+    'web',
+    'tv',
+)
+
+# Warning substrings emitted by yt-dlp that are known-harmless: they mean
+# some optional format sources are skipped, but other clients in the list
+# still serve usable audio. Suppressed to keep logs readable.
+_SUPPRESSED_YT_WARNING_FRAGMENTS = (
+    'GVS PO Token which was not provided',
+    'Some tv client https formats have been skipped as they are DRM',
+    'Signature solving failed: Some formats may be missing',
+    'n challenge solving failed: Some formats may be missing',
+)
+
+
+class _YtdlpLogger:
+    @staticmethod
+    def debug(msg: str) -> None:
+        pass
+
+    @staticmethod
+    def info(msg: str) -> None:
+        pass
+
+    @staticmethod
+    def warning(msg: str) -> None:
+        if not any(frag in msg for frag in _SUPPRESSED_YT_WARNING_FRAGMENTS):
+            logger.warning('yt-dlp: {}', msg)
+
+    @staticmethod
+    def error(msg: str) -> None:
+        logger.error('yt-dlp: {}', msg)
+
+
+def _yt_player_clients() -> list[str]:
+    raw = os.getenv('DOWNTIFY_YT_PLAYER_CLIENTS', '').strip()
+    if not raw:
+        return list(_DEFAULT_YT_PLAYER_CLIENTS)
+    clients = [c.strip() for c in raw.split(',') if c.strip()]
+    return clients or list(_DEFAULT_YT_PLAYER_CLIENTS)
+
+
+def _yt_po_tokens() -> list[str]:
+    """Comma-separated PO Tokens, each in the form ``<client>.<context>+<token>``.
+
+    Example: ``mweb.gvs+ABC123,web.gvs+XYZ987``
+    """
+    raw = os.getenv('DOWNTIFY_YT_PO_TOKEN', '').strip()
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(',') if t.strip()]
+
+
+# Substrings YouTube/yt-dlp use when a video is behind the age wall.
+_AGE_GATE_ERROR_FRAGMENTS = (
+    'confirm your age',
+    'age-restricted',
+    'inappropriate for some users',
+    'age_verification_required',
+    'age_check_required',
+)
+
+
+def is_age_restricted_error(message: str) -> bool:
+    return any(
+        fragment in message.lower() for fragment in _AGE_GATE_ERROR_FRAGMENTS
+    )
+
+
+def _translate_download_error(
+    exc: Exception, song: dict[str, Any], has_cookies: bool
+) -> Exception:
+    """Replace yt-dlp's age-gate error with something actionable.
+
+    The raw error is a wall of yt-dlp CLI advice (``--cookies-from-browser``,
+    wiki links) that means nothing to someone using the web UI, and it's
+    the single most common "downloads are broken" report. Every other
+    failure is passed through untouched.
+    """
+
+    if not is_age_restricted_error(str(exc)):
+        return exc
+    name = song.get('name') or 'This track'
+    if has_cookies:
+        return RuntimeError(
+            f'"{name}" is age-restricted on YouTube and the configured '
+            'cookies file was not accepted. Export a fresh cookies.txt '
+            'while logged into a YouTube account that has completed '
+            "Google's age verification, then upload it again in "
+            'Settings > YouTube cookies.'
+        )
+    return RuntimeError(
+        f'"{name}" has explicit content and YouTube only serves it to a '
+        'signed-in adult account. Upload a YouTube cookies.txt in '
+        'Settings > YouTube cookies to download it.'
+    )
+
+
+class Downloader:
+    """Wraps ``yt-dlp`` plus ``mutagen`` tagging."""
+
+    #: Called as ``on_downloaded(song, filename)`` once a *new* file has been
+    #: downloaded and tagged - not for a song that was already in the library.
+    #: Set by the app (``main.py``) to hook work on to a finished download
+    #: (see ``api.enrich_artist_after_download``); it runs on the download's
+    #: own thread, so it must only hand the work off and return. Whatever it
+    #: raises is logged and never fails the download.
+    on_downloaded: Optional[Callable[[dict[str, Any], str], None]] = None
+
+    def __init__(
+        self,
+        download_dir: Path | str,
+        audio_format: str = 'mp3',
+        audio_bitrate: str = '320',
+        output_template: str = '{artists} - {title}',
+        lyrics_providers: Optional[list[str]] = None,
+        lyrics_cache: Optional[Any] = None,
+        organize_by_artist: bool = False,
+        organize_by_album: bool = False,
+        download_cover_art: bool = True,
+        overwrite_existing_files: bool = True,
+        cookies_store: Optional[CookiesStore] = None,
+        audio_providers: Optional[list[str]] = None,
+        slskd_settings: Optional[dict[str, Any]] = None,
+    ):
+        self.download_dir = Path(download_dir)
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.audio_providers = self._normalize_audio_providers(audio_providers)
+        self.slskd_settings = self._normalize_slskd_settings(slskd_settings)
+        # slskd copies a finished transfer here when it isn't left in place.
+        self.slskd_settings['output_dir'] = str(self.download_dir)
+        # Resolves DOWNTIFY_COOKIES_FILE and the cookies.txt uploaded
+        # through the settings UI, in that order of precedence. ``None``
+        # keeps the env-var-only behavior for direct/standalone use.
+        self.cookies_store = cookies_store
+        self.audio_format = audio_format
+        self.audio_bitrate = audio_bitrate
+        self.output_template = output_template
+        self.lyrics_providers = list(lyrics_providers or [])
+        # Optional LyricsLookupCache: skips providers that already came
+        # back empty for a song.
+        self.lyrics_cache = lyrics_cache
+        self.organize_by_artist = organize_by_artist
+        self.organize_by_album = organize_by_album
+        self.overwrite_existing_files = overwrite_existing_files
+        self.download_cover_art = download_cover_art
+        self._target_locks: dict[str, threading.Lock] = {}
+        self._target_locks_guard = threading.Lock()
+
+    @staticmethod
+    def _normalize_audio_providers(
+        providers: Optional[list[str]],
+    ) -> list[str]:
+        """Known providers in the given order, deduplicated.
+
+        Defaults to YouTube Music, which already falls back to standard
+        YouTube inside :func:`providers.find_match`.
+        """
+
+        out: list[str] = []
+        for raw in providers or []:
+            name = str(raw or '').strip()
+            if name in AUDIO_PROVIDERS and name not in out:
+                out.append(name)
+        return out or ['youtube-music']
+
+    @staticmethod
+    def _normalize_slskd_settings(
+        settings: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raw = settings if isinstance(settings, dict) else {}
+
+        def _int(value: Any, default: int, low: int, high: int) -> int:
+            try:
+                number = int(value if value is not None else default)
+            except (TypeError, ValueError):
+                number = default
+            return min(high, max(low, number))
+
+        download_dir = str(raw.get('download_dir') or '/downloads').strip()
+        return {
+            'enabled': bool(raw.get('enabled', False)),
+            'base_url': str(raw.get('base_url') or '').strip().rstrip('/'),
+            'api_key': str(raw.get('api_key') or '').strip(),
+            'download_dir': download_dir,
+            'source_dir': str(raw.get('source_dir') or download_dir).strip(),
+            'timeout_seconds': _int(raw.get('timeout_seconds'), 20, 1, 3600),
+            'search_retries': _int(raw.get('search_retries'), 5, 1, 100),
+            'search_poll_seconds': _int(
+                raw.get('search_poll_seconds'), 15, 1, 3600
+            ),
+            'download_attempts': _int(raw.get('download_attempts'), 5, 1, 100),
+            'poll_interval_seconds': _int(
+                raw.get('poll_interval_seconds'), 5, 1, 3600
+            ),
+            'poll_max_attempts': _int(
+                raw.get('poll_max_attempts'), 60, 1, 10000
+            ),
+            'download_timeout_seconds': _int(
+                raw.get('download_timeout_seconds'), 600, 30, 3600
+            ),
+            'queued_timeout_seconds': _int(
+                raw.get('queued_timeout_seconds'), 180, 15, 3600
+            ),
+            'duration_tolerance_seconds': _int(
+                raw.get('duration_tolerance_seconds'), 10, 1, 120
+            ),
+            'duration_tolerance_percent': _int(
+                raw.get('duration_tolerance_percent'), 15, 1, 100
+            ),
+            'mix_duration_tolerance_percent': _int(
+                raw.get('mix_duration_tolerance_percent'), 50, 1, 200
+            ),
+            'extensions': raw.get('extensions') or ['mp3', 'flac'],
+            'min_bitrate': _int(raw.get('min_bitrate'), 256, 0, 10000),
+            'leave_in_place': bool(raw.get('leave_in_place', True)),
+            'max_parallel_downloads': _int(
+                raw.get('max_parallel_downloads'), 3, 1, 8
+            ),
+        }
+
+    def _resolve_source(
+        self,
+        song: dict[str, Any],
+        progress_cb: Optional[ProgressCallback],
+    ) -> tuple[
+        Optional[str], Optional[dict[str, Any]], Optional[str], Optional[Path]
+    ]:
+        """Try each audio provider in order.
+
+        Returns ``(video_id, ytm_match, provider, local_path)``: a YouTube
+        video id (with its YouTube Music result, if any) or, for slskd, the
+        path of the already-downloaded file. All ``None`` when every
+        provider came up empty.
+        """
+
+        youtube_searched = False
+        for provider in self.audio_providers:
+            if provider == 'slskd':
+                if not self.slskd_settings.get('enabled'):
+                    continue
+                local = download_from_slskd(
+                    song, self.slskd_settings, progress_cb=progress_cb
+                )
+                if local is not None:
+                    return None, None, 'slskd', local
+                logger.info(
+                    'Audio provider slskd: no match for {!r}', song.get('name')
+                )
+                _report(progress_cb, 0.0, 'Trying next source', 'slskd')
+            elif provider == 'youtube-music':
+                # find_match falls back to standard YouTube on its own when
+                # YouTube Music has nothing (or only a far-off length).
+                video_id, match = find_match(song)
+                youtube_searched = True
+                if video_id:
+                    return (
+                        video_id,
+                        match,
+                        'youtube-music' if match is not None else 'youtube',
+                        None,
+                    )
+            elif provider == 'youtube' and not youtube_searched:
+                video_id = find_match_youtube_only(song)
+                youtube_searched = True
+                if video_id:
+                    return video_id, None, 'youtube', None
+        return None, None, None, None
+
+    def _resolve_cookies_file(self) -> str:
+        """Path to the cookies.txt yt-dlp should use, or ``''``.
+
+        With a store configured this is DOWNTIFY_COOKIES_FILE, else the
+        file uploaded through the settings UI. Resolved per download so
+        uploading or deleting one takes effect without a restart.
+        """
+        if self.cookies_store is not None:
+            active = self.cookies_store.active_path()
+            return str(active) if active else ''
+        return os.getenv('DOWNTIFY_COOKIES_FILE', '').strip()
+
+    @staticmethod
+    def _artist_subdir(song: dict[str, Any]) -> str:
+        # Prefer the source's own album-level artist (set for YouTube
+        # Music albums) so every track in an album lands in the same
+        # folder even when one track's own `artists` differs (a feature,
+        # a remix credit, ...) — mirrors the album-artist tag fallback in
+        # `embed_metadata`.
+        album_artist = (song.get('album_artist') or '').strip()
+        if album_artist:
+            return _sanitize(album_artist)
+        artists = song.get('artists') or []
+        return _sanitize(artists[0] if artists else 'unknown')
+
+    @staticmethod
+    def _album_subdir(song: dict[str, Any]) -> str:
+        return _sanitize(song.get('album_name') or 'unknown')
+
+    def _effective_subdir(
+        self, song: dict[str, Any], fallback: Optional[str]
+    ) -> Optional[str]:
+        """Resolve the destination sub-directory for ``song``.
+
+        The ``organize_by_*`` toggles take precedence over the caller's
+        ``fallback`` (e.g. a per-playlist folder). When both are enabled
+        the layout nests as ``<Artist>/<Album>/``; a single toggle yields
+        just that one level. When neither is set the ``fallback`` is used
+        unchanged.
+        """
+
+        parts: list[str] = []
+        if self.organize_by_artist:
+            parts.append(self._artist_subdir(song))
+        if self.organize_by_album:
+            parts.append(self._album_subdir(song))
+        if parts:
+            return '/'.join(parts)
+        return fallback
+
+    def _save_album_cover(
+        self,
+        target_dir: Path,
+        song: dict[str, Any],
+        cover_bytes: Optional[bytes] = None,
+    ) -> None:
+        """Save the album art as ``cover.jpg`` inside the album folder.
+
+        Only runs when organizing by album, so ``target_dir`` is the
+        album's own folder. ``song['cover_url']`` already points at the
+        largest image Spotify offers (see ``spotify._largest_image``).
+        Skipped when ``cover.jpg`` already exists so the art is fetched
+        once per album rather than once per track. ``cover_bytes``, when
+        already fetched for embedding, is written instead of downloading
+        the image again.
+        """
+
+        if not self.organize_by_album:
+            return
+        cover_path = target_dir / 'cover.jpg'
+        if cover_path.exists():
+            return
+        data = cover_bytes or _download_cover(song.get('cover_url', ''))
+        if not data:
+            return
+        try:
+            cover_path.write_bytes(data)
+        except OSError:
+            logger.opt(exception=True).warning(
+                'Could not write album cover {}', cover_path
+            )
+
+    @staticmethod
+    def _template_values(song: dict[str, Any]) -> dict[str, str]:
+        artist_names = [_sanitize(a) for a in (song.get('artists') or [])]
+        artists = ', '.join(a for a in artist_names if a) or 'Unknown Artist'
+        # Same normalization used for the embedded tag (see
+        # _album_track_index_for_tags): only a positive integer counts,
+        # anything else (missing, non-numeric, a free-text/YouTube search
+        # result with no Spotify track_number) renders as ''. Zero-padded
+        # to 2 digits so "{tracknumber} - {title}" sorts correctly in a
+        # file browser (2 < 10 lexicographically without padding).
+        track_number, _ = _album_track_index_for_tags(song)
+        # Same source as the embedded tag (_recording_date_for_tags): a
+        # full release date or a bare year, so just the leading 4 digits.
+        # Empty when the source has no date at all, same tolerance as
+        # tracknumber above.
+        date = _recording_date_for_tags(song)
+        year = date[:4] if date[:4].isdigit() else ''
+        return {
+            'title': _sanitize(song.get('name', 'Unknown')),
+            'artists': artists,
+            'artist': artists,
+            'album': _sanitize(song.get('album_name', '')),
+            'tracknumber': f'{track_number:02d}' if track_number else '',
+            'year': year,
+        }
+
+    def _format_output_parts(self, song: dict[str, Any]) -> list[str]:
+        """Render the output template as safe relative path components."""
+
+        template = self.output_template.replace('.{output-ext}', '')
+        try:
+            rendered = template.format(**self._template_values(song))
+        except (KeyError, IndexError):
+            values = self._template_values(song)
+            rendered = f'{values["artists"]} - {values["title"]}'
+
+        parts = [_sanitize(part) for part in re.split(r'[\\/]+', rendered)]
+        parts = [part for part in parts if part]
+        return parts or ['unknown']
+
+    def _format_basename(self, song: dict[str, Any]) -> str:
+        return '/'.join(self._format_output_parts(song))
+
+    def existing_filename_for(
+        self,
+        song: dict[str, Any],
+        subdir: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the on-disk filename for ``song`` if any matching file exists.
+
+        Mirrors :meth:`download`'s post-conversion path resolution: prefers
+        ``{basename}.{audio_format}`` and falls back to any
+        ``{basename}.*`` since yt-dlp occasionally keeps the upstream
+        extension (opus, m4a). Returns ``None`` when no file matches.
+
+        When ``subdir`` is given the lookup is scoped to that
+        sub-directory and the returned name is relative to
+        ``download_dir`` (``<subdir>/<file>.<ext>``).
+        """
+
+        output_parts = self._format_output_parts(song)
+        basename = output_parts[-1]
+        output_subdir = (
+            Path(*output_parts[:-1]) if len(output_parts) > 1 else None
+        )
+        effective_subdir = self._effective_subdir(song, subdir)
+        target_dir, prefix = self._resolve_target_dir(effective_subdir)
+        if output_subdir is not None:
+            target_dir /= output_subdir
+            prefix = f'{prefix}{output_subdir.as_posix()}/'
+        primary = target_dir / f'{basename}.{self.audio_format}'
+        if primary.exists():
+            return f'{prefix}{primary.name}'
+        # Not a glob: titles like "Song [Live]" are glob character classes.
+        if target_dir.is_dir():
+            for candidate in sorted(target_dir.iterdir()):
+                stem, dot, ext = candidate.name.rpartition('.')
+                if (
+                    dot
+                    and stem == basename
+                    and ext.lower() in _AUDIO_EXTENSIONS
+                    and candidate.is_file()
+                ):
+                    return f'{prefix}{candidate.name}'
+        return None
+
+    def find_existing_download(
+        self,
+        song: dict[str, Any],
+        subdir: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return a file anywhere in the library that already holds ``song``.
+
+        Checks the exact destination first, then the whole library for an
+        audio file whose name (and any folders the output template adds)
+        matches, case-insensitively. That catches the same song saved by
+        a single-track download (library root), by another playlist's
+        folder, or under a previous organize-by-artist/album layout.
+        Matching is by rendered filename, not by track id: the files carry
+        no id to compare against.
+        """
+
+        exact = self.existing_filename_for(song, subdir)
+        if exact is not None:
+            return exact
+        wanted = [p.casefold() for p in self._format_output_parts(song)]
+        return self._scan_library(wanted[-1], wanted[:-1])
+
+    def _scan_library(self, stem: str, parents: list[str]) -> Optional[str]:
+        root_dir = self.download_dir
+        for root, dirs, files in os.walk(root_dir):
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+            for name in sorted(files):
+                base, dot, ext = name.rpartition('.')
+                if (
+                    not dot
+                    or ext.lower() not in _AUDIO_EXTENSIONS
+                    or base.casefold() != stem
+                ):
+                    continue
+                rel = Path(root, name).relative_to(root_dir)
+                if parents:
+                    folders = [p.casefold() for p in rel.parts[:-1]]
+                    if folders[-len(parents) :] != parents:
+                        continue
+                return rel.as_posix()
+        return None
+
+    def _can_resolve_path_early(self, song: dict[str, Any]) -> bool:
+        """Whether ``song`` already has every field its output path needs.
+
+        True for Spotify-sourced songs, which lets the existing-file check
+        run before the YouTube Music search instead of after it. Anything
+        the template needs that only enrichment could fill in (album,
+        track number) makes this False, so an incomplete early path can
+        never match an unrelated file.
+        """
+
+        if not (song.get('name') and song.get('artists')):
+            return False
+        template = self.output_template
+        if (self.organize_by_album or '{album}' in template) and not song.get(
+            'album_name'
+        ):
+            return False
+        if '{tracknumber}' in template:
+            track_number, _ = _album_track_index_for_tags(song)
+            if not track_number:
+                return False
+        return True
+
+    def _target_lock(self, song: dict[str, Any]) -> threading.Lock:
+        key = '/'.join(p.casefold() for p in self._format_output_parts(song))
+        with self._target_locks_guard:
+            return self._target_locks.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _skip_existing(
+        existing: str, progress_cb: Optional[ProgressCallback]
+    ) -> str:
+        logger.info('Skipping download, file already exists: {}', existing)
+        _report(progress_cb, 100.0, 'Already downloaded')
+        return existing
+
+    def _resolve_target_dir(self, subdir: Optional[str]) -> tuple[Path, str]:
+        """Return ``(target_dir, relative_prefix)`` for an optional subdir.
+
+        ``subdir`` may contain ``/`` separators to express a nested
+        layout (e.g. ``<Artist>/<Album>``); each path component is
+        sanitised individually so the separators survive. The
+        ``relative_prefix`` is empty when ``subdir`` is not used and
+        otherwise terminates with ``'/'`` so callers can build the
+        download-dir-relative path with simple concatenation.
+        """
+
+        if not subdir:
+            return self.download_dir, ''
+        parts = [
+            sanitize_playlist_name(p) for p in subdir.split('/') if p.strip()
+        ]
+        if not parts:
+            return self.download_dir, ''
+        rel = '/'.join(parts)
+        return self.download_dir / Path(*parts), f'{rel}/'
+
+    def download(
+        self,
+        song: dict[str, Any],
+        progress_cb: Optional[ProgressCallback] = None,
+        subdir: Optional[str] = None,
+    ) -> str:
+        """Download ``song`` and return the resulting file name.
+
+        When ``subdir`` is provided the file is written under
+        ``download_dir/<sanitized_subdir>/`` and the returned name is
+        relative to ``download_dir`` (``<subdir>/<file>.<ext>``). This
+        is how playlist downloads are grouped into per-playlist folders.
+
+        With ``overwrite_existing_files`` off, a song already anywhere in
+        the library is not downloaded again; the existing file's name is
+        returned instead (see :meth:`find_existing_download`).
+        """
+
+        skip_existing = not self.overwrite_existing_files
+        if skip_existing and self._can_resolve_path_early(song):
+            existing = self.find_existing_download(song, subdir)
+            if existing is not None:
+                return self._skip_existing(existing, progress_cb)
+
+        video_id = song.get('youtube_id')
+        if not video_id and (song.get('source') == 'youtube'):
+            video_id = song.get('song_id')
+
+        match: Optional[dict[str, Any]] = None
+        provider: Optional[str] = 'youtube-music' if video_id else None
+        local_source: Optional[Path] = None
+        if not video_id:
+            # Playlist rows lack year/track number; the per-track embed has
+            # them, and they can feed the output path and the slskd match.
+            song = spotify_mod.enrich_track_from_spotify_if_sparse(song)
+            video_id, match, provider, local_source = self._resolve_source(
+                song, progress_cb
+            )
+        elif not song.get('album_name') or not song.get('cover_url'):
+            # We already have a target video, but the metadata is incomplete.
+            # Look up the YT Music entry for THIS specific videoId so we
+            # don't risk switching to a karaoke / cover that happens to
+            # rank higher.
+            try:
+                match = find_match_for_video(song, video_id)
+            except Exception:
+                logger.opt(exception=True).debug('enrichment match failed')
+                match = None
+
+        if not video_id and local_source is None:
+            source = (
+                'an audio match'
+                if 'slskd' in self.audio_providers
+                and self.slskd_settings.get('enabled')
+                else 'a YouTube match'
+            )
+            raise NoAudioMatchError(
+                f'Could not find {source} for {song.get("name")!r}'
+            )
+
+        song = enrich_from_match(song, match)
+
+        if local_source is not None:
+            return self._downloaded(
+                song,
+                self._finalize_local_source(
+                    song, local_source, provider, progress_cb, subdir
+                ),
+            )
+
+        if not skip_existing:
+            return self._downloaded(
+                song,
+                self._fetch_and_tag(
+                    song, video_id, progress_cb, subdir, provider
+                ),
+            )
+
+        # Re-checked after enrichment (which can fill in the album/track
+        # number the path depends on), and serialized per target file so
+        # two downloads of the same song running at once — a duplicate row
+        # in one playlist, or two playlists sharing a track — can't both
+        # miss the check and fetch it twice.
+        with self._target_lock(song):
+            existing = self.find_existing_download(song, subdir)
+            if existing is not None:
+                return self._skip_existing(existing, progress_cb)
+            return self._downloaded(
+                song,
+                self._fetch_and_tag(
+                    song, video_id, progress_cb, subdir, provider
+                ),
+            )
+
+    def _downloaded(self, song: dict[str, Any], filename: str) -> str:
+        """Tell :attr:`on_downloaded` that *filename* is new; returns it.
+        A hook that fails is logged and ignored: the file is already there."""
+
+        hook = self.on_downloaded
+        if hook is not None:
+            try:
+                hook(song, filename)
+            except Exception:
+                logger.opt(exception=True).warning(
+                    'The after-download hook failed for {}', filename
+                )
+        return filename
+
+    def _target_location(
+        self, song: dict[str, Any], subdir: Optional[str]
+    ) -> tuple[Path, str, str]:
+        """``(target_dir, rel_prefix, basename)`` for a new file of ``song``.
+
+        Applies the organize-by-artist/album folders and any folders the
+        output template adds, and creates the directory.
+        """
+
+        output_parts = self._format_output_parts(song)
+        basename = output_parts[-1]
+        output_subdir = (
+            Path(*output_parts[:-1]) if len(output_parts) > 1 else None
+        )
+        effective_subdir = self._effective_subdir(song, subdir)
+        target_dir, rel_prefix = self._resolve_target_dir(effective_subdir)
+        if output_subdir is not None:
+            target_dir /= output_subdir
+            rel_prefix = f'{rel_prefix}{output_subdir.as_posix()}/'
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir, rel_prefix, basename
+
+    def _tag_file(
+        self,
+        final_path: Path,
+        target_dir: Path,
+        song: dict[str, Any],
+        found: _LookupResults,
+        *,
+        save_album_cover: bool = True,
+    ) -> None:
+        """Embed metadata, album cover.jpg and lyrics into ``final_path``."""
+
+        if found.genre:
+            song = {**song, 'genre': found.genre}
+
+        try:
+            embed_metadata(
+                final_path,
+                song,
+                download_cover=self.download_cover_art,
+                cover_bytes=found.cover_bytes,
+            )
+        except Exception:
+            logger.exception('Failed to embed metadata into {}', final_path)
+
+        if self.download_cover_art and save_album_cover:
+            try:
+                self._save_album_cover(target_dir, song, found.cover_bytes)
+            except Exception:
+                logger.exception(
+                    'Failed to write album cover in {}', target_dir
+                )
+
+        if found.lyrics is not None:
+            try:
+                embed_lyrics(final_path, found.lyrics)
+            except Exception:
+                logger.exception('Failed to embed lyrics into {}', final_path)
+
+    def _finalize_local_source(
+        self,
+        song: dict[str, Any],
+        source_path: Path,
+        provider: Optional[str],
+        progress_cb: Optional[ProgressCallback],
+        subdir: Optional[str],
+    ) -> str:
+        """Tag a file a provider already downloaded (slskd) and return its
+        library path.
+
+        With slskd's ``leave_in_place`` the file stays under the slskd
+        folder and is returned with the virtual ``slskd/`` prefix (served
+        via ``/media/slskd/...``); otherwise it's copied into the same
+        destination a YouTube download would use, keeping its original
+        format — slskd files are not transcoded.
+        """
+
+        lookups = _MetadataLookups(self, song)
+        try:
+            if provider == 'slskd' and self.slskd_settings.get(
+                'leave_in_place', True
+            ):
+                final_path = source_path
+                target_dir = source_path.parent
+                stored = library_stored_path(
+                    final_path,
+                    self.download_dir,
+                    slskd_dir_from_downloader(self),
+                )
+                in_place = True
+            else:
+                target_dir, rel_prefix, basename = self._target_location(
+                    song, subdir
+                )
+                suffix = source_path.suffix or f'.{self.audio_format}'
+                final_path = target_dir / f'{basename}{suffix}'
+                if source_path.resolve() != final_path.resolve():
+                    shutil.copy2(source_path, final_path)
+                stored = f'{rel_prefix}{final_path.name}'
+                in_place = False
+            found = lookups.collect()
+        finally:
+            lookups.cancel()
+
+        # Never drop a cover.jpg into slskd's own folders.
+        self._tag_file(
+            final_path,
+            target_dir,
+            song,
+            found,
+            save_album_cover=not in_place,
+        )
+        _report(progress_cb, 100.0, 'Done', provider)
+        return stored
+
+    @staticmethod
+    def _progress_hook(
+        progress_cb: Optional[ProgressCallback], provider: Optional[str]
+    ) -> Callable[[dict[str, Any]], None]:
+        """A yt-dlp progress hook forwarding to *progress_cb*.
+
+        yt-dlp calls the hook for every downloaded chunk, and each report
+        becomes a WebSocket broadcast scheduled on the event loop — only
+        forward it when the whole-number percentage actually changes.
+        """
+
+        last_reported_pct = -1
+
+        def hook(data: dict[str, Any]) -> None:
+            nonlocal last_reported_pct
+            if progress_cb is None:
+                return
+            try:
+                status = data.get('status')
+                if status == 'downloading':
+                    total = (
+                        data.get('total_bytes')
+                        or data.get('total_bytes_estimate')
+                        or 0
+                    )
+                    downloaded = data.get('downloaded_bytes') or 0
+                    if total:
+                        pct = min(95.0, downloaded / total * 95.0)
+                        if int(pct) != last_reported_pct:
+                            last_reported_pct = int(pct)
+                            progress_cb(pct, 'Downloading', provider)
+                elif status == 'finished':
+                    progress_cb(96.0, 'Converting', provider)
+            except Exception:
+                logger.opt(exception=True).debug('progress hook error')
+
+        return hook
+
+    def _ydl_options(
+        self, out_template: str, hook: Callable[[dict[str, Any]], None]
+    ) -> tuple[dict[str, Any], bool]:
+        """``(yt-dlp options, whether cookies are used)`` for one audio
+        download to *out_template*."""
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': out_template,
+            'quiet': True,
+            'noprogress': True,
+            'logger': _YtdlpLogger(),
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'overwrites': True,
+            'progress_hooks': [hook],
+            # Resilience against flaky DNS/network in containers.
+            # googlevideo.com CDN hosts are short-lived shards and a single
+            # transient EAI_AGAIN/timeout used to abort the whole download.
+            'retries': 10,
+            'fragment_retries': 10,
+            'extractor_retries': 3,
+            'socket_timeout': 30,
+            # The default `web` player_client is the one most aggressively
+            # gated by YouTube's "Sign in to confirm you're not a bot"
+            # check on datacenter IPs. `tv` and `mweb` almost always
+            # bypass it. Order matters — yt-dlp tries them in sequence.
+            'extractor_args': {
+                'youtube': {'player_client': _yt_player_clients()}
+            },
+            # `web`/`web_embedded` need a JS runtime to solve YouTube's
+            # signature/n-challenges (see the comment on
+            # _DEFAULT_YT_PLAYER_CLIENTS above) — that's the only real
+            # fallback once `ios`/`android` get SABR-gated. yt-dlp
+            # refuses to fetch its EJS challenge-solver script by
+            # default, so without this the JS runtime never actually
+            # gets used and those two clients silently yield no audio
+            # (see henriquesebastiao/downtify#247).
+            'remote_components': ['ejs:github'],
+            # Light pacing so we don't trigger 429 rate limits when the
+            # user fires off multiple downloads back-to-back.
+            'sleep_interval_requests': 1,
+        }
+        # Many container setups have IPv6 advertised but unroutable for
+        # googlevideo.com, which surfaces as EAI_AGAIN on the AAAA lookup.
+        # Setting DOWNTIFY_FORCE_IPV4=1 binds yt-dlp to IPv4 only.
+        if os.getenv('DOWNTIFY_FORCE_IPV4', '').strip() in {
+            '1',
+            'true',
+            'yes',
+        }:
+            ydl_opts['source_address'] = '0.0.0.0'
+
+        # Cookies authenticate yt-dlp as a real browser session — needed
+        # for age-restricted (explicit) tracks and whenever YouTube
+        # challenges the download. The file comes either from
+        # DOWNTIFY_COOKIES_FILE or from the settings UI upload, resolved
+        # by the store in that order; DOWNTIFY_COOKIES_FROM_BROWSER takes
+        # "<browser>" or "<browser>:<profile>" (e.g. "firefox" or
+        # "chrome:Default").
+        cookies_file = self._resolve_cookies_file()
+        if cookies_file:
+            ydl_opts['cookiefile'] = cookies_file
+        cookies_browser = os.getenv(
+            'DOWNTIFY_COOKIES_FROM_BROWSER', ''
+        ).strip()
+        if cookies_browser:
+            parts = cookies_browser.split(':', 1)
+            ydl_opts['cookiesfrombrowser'] = (
+                (parts[0],) if len(parts) == 1 else (parts[0], parts[1])
+            )
+
+        return ydl_opts, bool(cookies_file or cookies_browser)
+
+    def fetch_audio(
+        self,
+        video_id: str,
+        target_dir: Path,
+        basename: str,
+        *,
+        song: dict[str, Any],
+        progress_cb: Optional[ProgressCallback] = None,
+        provider: Optional[str] = None,
+        audio_format: Optional[str] = None,
+    ) -> Path:
+        """Download YouTube video *video_id*'s audio as
+        ``<target_dir>/<basename>.<audio_format>`` (default: the chosen
+        format) and return the file - untagged. *song* only words the
+        error when it fails."""
+
+        fmt = audio_format or self.audio_format
+        out_template = str(target_dir / f'{basename}.%(ext)s')
+        hook = self._progress_hook(progress_cb, provider)
+        ydl_opts, has_cookies = self._ydl_options(out_template, hook)
+        url = f'https://music.youtube.com/watch?v={video_id}'
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Registered directly: `ydl_opts['postprocessors']` only
+                # accepts yt-dlp's built-in postprocessors by name.
+                ydl.add_post_processor(
+                    _ExtractAudioPP(ydl, fmt, self.audio_bitrate),
+                    when='post_process',
+                )
+                ydl.download([url])
+        except Exception as exc:
+            raise _translate_download_error(
+                exc, song, has_cookies=has_cookies
+            ) from exc
+
+        final_path = target_dir / f'{basename}.{fmt}'
+        if not final_path.exists():
+            # yt-dlp sometimes uses the upstream extension for opus/m4a
+            for candidate in target_dir.glob(f'{basename}.*'):
+                if candidate.is_file():
+                    final_path = candidate
+                    break
+        return final_path
+
+    def _fetch_and_tag(
+        self,
+        song: dict[str, Any],
+        video_id: str,
+        progress_cb: Optional[ProgressCallback],
+        subdir: Optional[str],
+        provider: Optional[str] = None,
+    ) -> str:
+        target_dir, rel_prefix, basename = self._target_location(song, subdir)
+
+        # Genre, cover art and lyrics are looked up while yt-dlp downloads,
+        # instead of one after another once it's done.
+        lookups = _MetadataLookups(self, song)
+        try:
+            final_path = self.fetch_audio(
+                video_id,
+                target_dir,
+                basename,
+                song=song,
+                progress_cb=progress_cb,
+                provider=provider,
+            )
+            found = lookups.collect()
+        finally:
+            # A failed download shouldn't wait on lookups nobody will use.
+            lookups.cancel()
+
+        self._tag_file(final_path, target_dir, song, found)
+        _report(progress_cb, 100.0, 'Done', provider)
+        return f'{rel_prefix}{final_path.name}'
+
+
+class _LookupResults:
+    """What :class:`_MetadataLookups` found (``None`` = nothing / failed)."""
+
+    def __init__(
+        self,
+        genre: Optional[str],
+        cover_bytes: Optional[bytes],
+        lyrics: Any,
+    ) -> None:
+        self.genre = genre
+        self.cover_bytes = cover_bytes
+        self.lyrics = lyrics
+
+
+class _MetadataLookups:
+    """Genre, cover-art and lyrics lookups for one song, run in parallel.
+
+    They depend only on the song's metadata, not on the audio file, so
+    callers start them while the audio itself is being fetched. The cover
+    is fetched once and reused for the embedded art and cover.jpg.
+    """
+
+    def __init__(self, downloader: Downloader, song: dict[str, Any]) -> None:
+        self._song = song
+        self._pool = ThreadPoolExecutor(
+            max_workers=3, thread_name_prefix='downtify-metadata'
+        )
+        self._genre = (
+            None
+            if song.get('genre')
+            else self._pool.submit(_fetch_itunes_genre, song)
+        )
+        self._cover = (
+            self._pool.submit(_download_cover, song.get('cover_url', ''))
+            if downloader.download_cover_art
+            else None
+        )
+        self._lyrics = (
+            self._pool.submit(
+                lyrics_mod.fetch,
+                song,
+                downloader.lyrics_providers,
+                downloader.lyrics_cache,
+            )
+            if downloader.lyrics_providers
+            else None
+        )
+
+    def collect(self) -> _LookupResults:
+        return _LookupResults(
+            genre=_lookup_result(
+                self._genre, 'iTunes genre lookup', self._song
+            ),
+            cover_bytes=_lookup_result(
+                self._cover, 'Cover download', self._song
+            ),
+            lyrics=_lookup_result(
+                self._lyrics, 'Lyrics fetch', self._song, error=True
+            ),
+        )
+
+    def cancel(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _report(
+    progress_cb: Optional[ProgressCallback],
+    pct: float,
+    message: str,
+    provider: Optional[str] = None,
+) -> None:
+    if progress_cb is not None:
+        progress_cb(pct, message, provider)
+
+
+def _lookup_result(
+    future: Optional[Future],
+    label: str,
+    song: dict[str, Any],
+    *,
+    error: bool = False,
+) -> Any:
+    """Result of one of ``_fetch_and_tag``'s concurrent metadata lookups.
+
+    A failed lookup never fails the download: it's logged (at ERROR when
+    ``error`` is set, DEBUG otherwise) and treated as "nothing found".
+    """
+
+    if future is None:
+        return None
+    try:
+        return future.result()
+    except Exception:
+        log = logger.opt(exception=True)
+        (log.error if error else log.debug)(
+            '{} failed for {!r}', label, song.get('name')
+        )
+        return None
+
+
+def _download_cover(url: str) -> Optional[bytes]:
+    if not url:
+        return None
+    try:
+        response = httpx.get(url, timeout=15)
+        response.raise_for_status()
+    except Exception:
+        logger.opt(exception=True).warning('Failed to fetch cover art {}', url)
+        return None
+    return response.content
+
+
+def save_playlist_cover(cover_url: str, m3u_path: Path) -> Optional[Path]:
+    """Save a playlist's cover art next to its M3U file.
+
+    Writes ``<playlist-name>.jpg`` beside *m3u_path*, reusing whatever
+    URL the caller resolved as the largest cover art the source
+    (Spotify or YouTube Music) offers for that playlist — both always
+    serve JPEG for these URLs, so the extension is fixed rather than
+    sniffed from the response. Returns the written path, or ``None``
+    when there's no cover URL, the fetch fails, or the file can't be
+    written.
+    """
+
+    data = _download_cover(cover_url)
+    if not data:
+        return None
+    cover_path = m3u_path.with_suffix('.jpg')
+    try:
+        # The cover can land before the first track, so the playlist's
+        # folder may not exist yet.
+        cover_path.parent.mkdir(parents=True, exist_ok=True)
+        cover_path.write_bytes(data)
+    except OSError:
+        logger.opt(exception=True).warning(
+            'Could not write playlist cover {}', cover_path
+        )
+        return None
+    return cover_path
+
+
+def _album_track_index_for_tags(
+    song: dict[str, Any],
+) -> tuple[Optional[int], Optional[int]]:
+    """Normalize ``track_number`` / ``album_track_total`` for tagging frames."""
+    raw_n = song.get('track_number')
+    raw_tot = song.get('album_track_total')
+    try:
+        n = int(raw_n)
+    except (TypeError, ValueError):
+        return None, None
+    if n <= 0:
+        return None, None
+    tot: Optional[int] = None
+    if raw_tot is not None and raw_tot != '':
+        try:
+            t = int(raw_tot)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if t > 0:
+                tot = t
+    return n, tot
+
+
+def _recording_date_for_tags(song: dict[str, Any]) -> str:
+    """Prefer full ``YYYY-MM-DD`` from Spotify; fall back to year-only."""
+
+    rd = str(song.get('release_date') or '').strip()
+    if rd:
+        return rd
+    return str(song.get('year') or '').strip()
+
+
+def _album_artist_for_tags(artists: list[str]) -> Optional[str]:
+    if not artists:
+        return None
+    if len(artists) > 1:
+        return 'Various Artists'
+    if re.search(r'\s*(?:,|，|&)\s*', artists[0]):
+        return 'Various Artists'
+    return artists[0]
+
+
+def _release_type_for_tags(song: dict[str, Any]) -> str:
+    """YouTube Music's release classification ('album'/'single'/'ep'),
+    lower-cased to match the MusicBrainz Picard tagging convention used
+    by most taggers/media servers (``MusicBrainz Album Type`` / Vorbis
+    ``RELEASETYPE`` / the MP4 freeform equivalent)."""
+
+    return str(song.get('release_type') or '').strip().lower()
+
+
+def embed_metadata(
+    path: Path,
+    song: dict[str, Any],
+    *,
+    download_cover: bool = True,
+    cover_bytes: Optional[bytes] = None,
+) -> None:
+    if not path.exists():
+        return
+
+    title = song.get('name', '')
+    artists = song.get('artists') or []
+    # Prefer the source's own album-level artist (set for YouTube Music
+    # albums — see `providers._album_track_song`) so every track in an
+    # album gets the same tag even when one track's own artists differ
+    # (a feature, a remix credit, ...). Falls back to a per-track heuristic
+    # when the source doesn't know an album artist (single-track/playlist
+    # downloads).
+    album_artist = song.get('album_artist') or _album_artist_for_tags(artists)
+    album = song.get('album_name', '') or ''
+    recording_date = _recording_date_for_tags(song)
+    genre = (song.get('genre') or '').strip()
+    release_type = _release_type_for_tags(song)
+    if not download_cover:
+        cover_bytes = None
+    elif cover_bytes is None:
+        cover_bytes = _download_cover(song.get('cover_url', ''))
+    track_number, album_track_total = _album_track_index_for_tags(song)
+    if track_number is None:
+        logger.info(
+            'Tag embed: no track_number/disc position for file={} '
+            'song_id={} title={!r} raw_track_number={!r} raw_total={!r}',
+            path.name,
+            song.get('song_id'),
+            title,
+            song.get('track_number'),
+            song.get('album_track_total'),
+        )
+    if not recording_date:
+        logger.info(
+            'Tag embed: no recording date (year/release_date) for file={} '
+            'song_id={} title={!r} raw_year={!r} raw_release_date={!r}',
+            path.name,
+            song.get('song_id'),
+            title,
+            song.get('year'),
+            song.get('release_date'),
+        )
+    logger.debug(
+        'Tag embed summary: {} track={}/{} date={!r}',
+        path.name,
+        track_number,
+        album_track_total,
+        recording_date,
+    )
+
+    suffix = path.suffix.lower().lstrip('.')
+
+    if suffix == 'mp3':
+        _tag_mp3(
+            path,
+            title,
+            artists,
+            album_artist,
+            album,
+            recording_date,
+            genre,
+            cover_bytes,
+            track_number,
+            album_track_total,
+            release_type,
+        )
+    elif suffix in {'m4a', 'mp4', 'aac'}:
+        _tag_mp4(
+            path,
+            title,
+            artists,
+            album_artist,
+            album,
+            recording_date,
+            genre,
+            cover_bytes,
+            track_number,
+            album_track_total,
+            release_type,
+        )
+    elif suffix == 'flac':
+        _tag_flac(
+            path,
+            title,
+            artists,
+            album_artist,
+            album,
+            recording_date,
+            genre,
+            cover_bytes,
+            track_number,
+            album_track_total,
+            release_type,
+        )
+    elif suffix in {'ogg', 'oga'}:
+        _tag_ogg_vorbis(
+            path,
+            title,
+            artists,
+            album_artist,
+            album,
+            recording_date,
+            genre,
+            cover_bytes,
+            track_number,
+            album_track_total,
+            release_type,
+        )
+    elif suffix == 'opus':
+        _tag_opus(
+            path,
+            title,
+            artists,
+            album_artist,
+            album,
+            recording_date,
+            genre,
+            cover_bytes,
+            track_number,
+            album_track_total,
+            release_type,
+        )
+
+
+def _tag_mp3(
+    path: Path,
+    title: str,
+    artists: list[str],
+    album_artist: Optional[str],
+    album: str,
+    year: str,
+    genre: str,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+) -> None:
+    audio = MP3(str(path), ID3=ID3)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.delall('APIC')
+    audio.tags.add(TIT2(encoding=3, text=title))
+    if artists:
+        audio.tags.add(TPE1(encoding=3, text='; '.join(artists)))
+    if album_artist:
+        audio.tags.add(TPE2(encoding=3, text=album_artist))
+    if album:
+        audio.tags.add(TALB(encoding=3, text=album))
+    if track_number is not None:
+        trck = (
+            f'{track_number}/{album_track_total}'
+            if album_track_total is not None
+            else str(track_number)
+        )
+        audio.tags.add(TRCK(encoding=3, text=trck))
+        # Downtify never handles multi-disc releases, so this is always "1" -
+        # but writing it is not just cosmetic: media servers/taggers that
+        # read a missing disc tag as 0 (rather than defaulting to 1) will
+        # otherwise fail to match this track against the same recording
+        # tagged by another source, since disc position is compared
+        # alongside track position.
+        audio.tags.add(TPOS(encoding=3, text='1'))
+    if year:
+        audio.tags.add(TDRC(encoding=3, text=year))
+    if genre:
+        audio.tags.add(TCON(encoding=3, text=genre))
+    if release_type:
+        audio.tags.delall('TXXX:MusicBrainz Album Type')
+        audio.tags.add(
+            TXXX(
+                encoding=3,
+                desc='MusicBrainz Album Type',
+                text=release_type,
+            )
+        )
+    if cover_bytes:
+        audio.tags.add(
+            APIC(
+                encoding=3,
+                mime='image/jpeg',
+                type=3,
+                desc='Cover',
+                data=cover_bytes,
+            )
+        )
+    # ID3v2.3 has no UTF-8 text encoding (only Latin-1/UTF-16), so saving
+    # v2.3 frames created with encoding=3 forces mutagen to transcode them
+    # to UTF-16 on write. That conversion corrupts the tail of the frame
+    # (observed: the last 1-2 characters replaced with garbage code
+    # points), which then desyncs the ID3 reader for every frame that
+    # follows TIT2 — silently dropping artist/album/genre/date/track
+    # number/cover on read. v2.4 supports UTF-8 natively, so no forced
+    # transcode happens.
+    audio.save(v2_version=4)
+
+
+def _tag_mp4(
+    path: Path,
+    title: str,
+    artists: list[str],
+    album_artist: Optional[str],
+    album: str,
+    year: str,
+    genre: str,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+) -> None:
+    audio = MP4(str(path))
+    audio['\xa9nam'] = title
+    if artists:
+        audio['\xa9ART'] = artists
+    if album_artist:
+        audio['aART'] = [album_artist]
+    if album:
+        audio['\xa9alb'] = album
+    if track_number is not None:
+        total = album_track_total if album_track_total is not None else 0
+        audio['trkn'] = [(track_number, total)]
+        # see the matching comment in _tag_mp3 for why disc=1 is always written
+        audio['disk'] = [(1, 0)]
+    if year:
+        audio['\xa9day'] = year
+    if genre:
+        audio['\xa9gen'] = genre
+    if release_type:
+        audio['----:com.apple.iTunes:MusicBrainz Album Type'] = [
+            MP4FreeForm(release_type.encode('utf-8'))
+        ]
+    if cover_bytes:
+        audio['covr'] = [
+            MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)
+        ]
+    audio.save()
+
+
+def _tag_flac(
+    path: Path,
+    title: str,
+    artists: list[str],
+    album_artist: Optional[str],
+    album: str,
+    year: str,
+    genre: str,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+) -> None:
+    audio = FLAC(str(path))
+    audio['title'] = title
+    if artists:
+        audio['artist'] = artists
+    if album_artist:
+        audio['albumartist'] = album_artist
+    if album:
+        audio['album'] = album
+    if track_number is not None:
+        audio['tracknumber'] = str(track_number)
+        if album_track_total is not None:
+            audio['tracktotal'] = str(album_track_total)
+        # see the matching comment in _tag_mp3 for why disc=1 is always written
+        audio['discnumber'] = '1'
+    if year:
+        audio['date'] = year
+    if genre:
+        audio['genre'] = genre
+    if release_type:
+        audio['releasetype'] = release_type
+    if cover_bytes:
+        picture = Picture()
+        picture.data = cover_bytes
+        picture.type = 3
+        picture.mime = 'image/jpeg'
+        audio.clear_pictures()
+        audio.add_picture(picture)
+    audio.save()
+
+
+def _tag_ogg_vorbis(
+    path: Path,
+    title: str,
+    artists: list[str],
+    album_artist: Optional[str],
+    album: str,
+    year: str,
+    genre: str,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+) -> None:
+    audio = OggVorbis(str(path))
+    _apply_vorbis_comments(
+        audio,
+        title,
+        artists,
+        album_artist,
+        album,
+        year,
+        genre,
+        cover_bytes,
+        track_number,
+        album_track_total,
+        release_type,
+    )
+    audio.save()
+
+
+def _tag_opus(
+    path: Path,
+    title: str,
+    artists: list[str],
+    album_artist: Optional[str],
+    album: str,
+    year: str,
+    genre: str,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+) -> None:
+    audio = OggOpus(str(path))
+    _apply_vorbis_comments(
+        audio,
+        title,
+        artists,
+        album_artist,
+        album,
+        year,
+        genre,
+        cover_bytes,
+        track_number,
+        album_track_total,
+        release_type,
+    )
+    audio.save()
+
+
+def _apply_vorbis_comments(
+    audio,
+    title,
+    artists,
+    album_artist,
+    album,
+    year,
+    genre,
+    cover_bytes: Optional[bytes],
+    track_number: Optional[int],
+    album_track_total: Optional[int],
+    release_type: str = '',
+):
+    audio['title'] = title
+    if artists:
+        audio['artist'] = artists
+    if album_artist:
+        audio['albumartist'] = album_artist
+    if album:
+        audio['album'] = album
+    if track_number is not None:
+        audio['TRACKNUMBER'] = str(track_number)
+        if album_track_total is not None:
+            audio['TRACKTOTAL'] = str(album_track_total)
+        # see the matching comment in _tag_mp3 for why disc=1 is always written
+        audio['DISCNUMBER'] = '1'
+    if year:
+        audio['date'] = year
+    if release_type:
+        audio['RELEASETYPE'] = release_type
+    if genre:
+        audio['genre'] = genre
+    if cover_bytes:
+        picture = Picture()
+        picture.data = cover_bytes
+        picture.type = 3
+        picture.mime = 'image/jpeg'
+        picture_data = picture.write()
+        encoded_data = base64.b64encode(picture_data).decode('ascii')
+        audio['metadata_block_picture'] = [encoded_data]
+
+
+def embed_lyrics(path: Path, lyrics: 'lyrics_mod.Lyrics') -> None:
+    """Embed plain lyrics into the audio tag and write a .lrc sidecar
+    next to it when synced lyrics are available."""
+
+    if not path.exists() or not lyrics.has_any():
+        return
+
+    if lyrics.synced:
+        sidecar = path.with_suffix('.lrc')
+        try:
+            sidecar.write_text(lyrics.synced, encoding='utf-8')
+        except OSError:
+            logger.opt(exception=True).warning(
+                'Could not write LRC sidecar {}', sidecar
+            )
+
+    text = lyrics.plain or _strip_lrc_timestamps(lyrics.synced or '')
+    if not text:
+        return
+
+    suffix = path.suffix.lower().lstrip('.')
+    if suffix == 'mp3':
+        audio = MP3(str(path), ID3=ID3)
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.delall('USLT')
+        audio.tags.add(USLT(encoding=3, lang='eng', desc='', text=text))
+        # See the matching comment in _tag_mp3: v2.3 forces a UTF-8 ->
+        # UTF-16 transcode on save that corrupts long text frames.
+        audio.save(v2_version=4)
+    elif suffix in {'m4a', 'mp4', 'aac'}:
+        audio = MP4(str(path))
+        audio['\xa9lyr'] = text
+        audio.save()
+    elif suffix == 'flac':
+        audio = FLAC(str(path))
+        audio['lyrics'] = text
+        audio.save()
+    elif suffix in {'ogg', 'oga'}:
+        audio = OggVorbis(str(path))
+        audio['lyrics'] = text
+        audio.save()
+    elif suffix == 'opus':
+        audio = OggOpus(str(path))
+        audio['lyrics'] = text
+        audio.save()
+
+
+def _strip_lrc_timestamps(synced: str) -> str:
+    cleaned = _re.sub(r'\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]', '', synced)
+    return '\n'.join(
+        line.strip() for line in cleaned.splitlines() if line.strip()
+    )

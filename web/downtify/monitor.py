@@ -1,0 +1,1567 @@
+"""Periodic playlist monitoring and automatic downloading."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sqlite3
+from dataclasses import asdict, dataclass
+from datetime import datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from loguru import logger
+
+from . import m3u, providers, spotify
+from .cover_cache import CoverArtCache
+from .downloader import (
+    DOWNLOAD_EXECUTOR,
+    Downloader,
+    ProgressCallback,
+    save_playlist_cover,
+)
+from .library_metadata_cache import LibraryMetadataCache
+from .library_paths import locate_library_file, slskd_dir_from_downloader
+from .library_paths_cache import invalidate_library_paths_cache
+from .navidrome import (
+    _effective_navidrome_settings,
+    cache_navidrome_song_id,
+    enrich_song_from_library_file,
+    sync_playlist_to_navidrome,
+)
+from .navidrome_index import NavidromeIndex
+from .playlist_catalog import PlaylistCatalog
+from .playlist_spotify_cache import PlaylistSpotifyCache
+from .podcasts import PodcastStore, sync_show
+from .track_index import TrackIndex, normalize_spotify_track_id
+
+MONITOR_LOOP_INTERVAL = 60  # seconds between loop sweeps
+# Seconds between filesystem reconciliation sweeps (see reconcile_loop).
+RECONCILE_LOOP_INTERVAL = 3600
+MINUTES_PER_DAY = 1440
+
+SYNC_TIME_ENV_VAR = 'DOWNTIFY_MONITOR_SYNC_TIME'
+
+
+@dataclass
+class LibraryStores:
+    """The library stores a sweep keeps up to date (see ``api.state``)."""
+
+    track_index: Optional[TrackIndex] = None
+    playlist_catalog: Optional[PlaylistCatalog] = None
+    navidrome_index: Optional[NavidromeIndex] = None
+    metadata_cache: Optional[LibraryMetadataCache] = None
+    cover_cache: Optional[CoverArtCache] = None
+    playlist_spotify_cache: Optional[PlaylistSpotifyCache] = None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sync_anchor_time() -> Optional[time]:
+    """Parse ``DOWNTIFY_MONITOR_SYNC_TIME`` (``HH:MM``, 24h, local time).
+
+    Returns ``None`` when unset or malformed, in which case scheduling
+    falls back to the plain ``last_checked + interval`` behavior. Only
+    read from the environment at call time (not cached) so it can be
+    changed without a restart of the whole process in tests, and so a
+    typo doesn't get baked in for the process lifetime.
+    """
+    raw = os.getenv(SYNC_TIME_ENV_VAR, '').strip()
+    if not raw:
+        return None
+    hour_str, _, minute_str = raw.partition(':')
+    try:
+        hour = int(hour_str)
+        minute = int(minute_str) if minute_str else 0
+        return time(hour, minute)
+    except ValueError:
+        logger.warning(
+            '{}={!r} is not a valid HH:MM time; ignoring it.',
+            SYNC_TIME_ENV_VAR,
+            raw,
+        )
+        return None
+
+
+def _next_due_at(last: datetime, interval_minutes: int) -> datetime:
+    """Compute when *last*'s next check is due.
+
+    For sub-day intervals this is simply ``last + interval``. For
+    intervals that are a whole number of days (daily, weekly, every 2
+    weeks, monthly), the result is additionally snapped to the
+    :data:`SYNC_TIME_ENV_VAR` time-of-day when it's set, so all
+    day-or-longer playlists sync at the same configured hour (e.g.
+    ``03:00``) instead of at whatever time the playlist happened to be
+    added or last checked. The date component always advances by at
+    least one full interval, so the snap never moves the due time
+    earlier than an unsnapped ``last + interval`` would allow.
+    """
+    due = last + timedelta(minutes=interval_minutes)
+    if interval_minutes % MINUTES_PER_DAY != 0:
+        return due
+    anchor = _sync_anchor_time()
+    if anchor is None:
+        return due
+    local_due = due.astimezone()
+    anchored_local = local_due.replace(
+        hour=anchor.hour, minute=anchor.minute, second=0, microsecond=0
+    )
+    return anchored_local.astimezone(timezone.utc)
+
+
+def _is_due(last_checked: Optional[str], interval_minutes: int) -> bool:
+    if last_checked is None:
+        return True
+    try:
+        last = datetime.fromisoformat(last_checked)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) >= _next_due_at(
+            last, interval_minutes
+        )
+    except ValueError:
+        return True
+
+
+KIND_PLAYLIST = 'playlist'
+KIND_ARTIST = 'artist'
+#: A podcast watch. ``spotify_id`` (the watch table's generic unique-key
+#: column) holds the show's RSS feed URL for this kind — there is no
+#: Spotify id involved. See ``downtify.podcasts`` for everything else
+#: about the show (retention, episodes, tags): this table only knows
+#: how to schedule the check.
+KIND_PODCAST = 'podcast'
+
+SOURCE_SPOTIFY = 'spotify'
+SOURCE_YOUTUBE_MUSIC = 'youtube_music'
+
+#: The kinds of release an artist watch can download (YouTube Music's own
+#: 'Album' / 'Single' / 'EP' split). A watch stores the ones it wants as a
+#: comma-separated list, in this order.
+RELEASE_ALBUM = 'album'
+RELEASE_SINGLE = 'single'
+RELEASE_EP = 'ep'
+RELEASE_TYPES = (RELEASE_ALBUM, RELEASE_SINGLE, RELEASE_EP)
+ALL_RELEASE_TYPES = ','.join(RELEASE_TYPES)
+
+
+def normalize_release_types(value: Any) -> str:
+    """*value* (a list or a comma-separated string) as the stored form:
+    the known release types it names, in :data:`RELEASE_TYPES` order.
+    ``""`` when it names none - callers treat that as invalid rather than
+    silently watching nothing."""
+
+    if isinstance(value, str):
+        items = value.split(',')
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        return ''
+    wanted = {str(item).strip().lower() for item in items}
+    return ','.join(t for t in RELEASE_TYPES if t in wanted)
+
+
+def release_type_of(album: dict[str, Any]) -> str:
+    """The :data:`RELEASE_TYPES` entry of a discography release. YouTube
+    Music labels each one 'Album', 'Single' or 'EP'; anything else (or no
+    label) counts as an album, which is what the albums shelf defaults
+    to."""
+
+    label = str(album.get('release_type') or '').strip().lower()
+    return label if label in {RELEASE_SINGLE, RELEASE_EP} else RELEASE_ALBUM
+
+
+def watch_source(url: str) -> str:
+    """The service a watch was added from, read off the URL it was added with.
+
+    Anything that isn't a YouTube URL is Spotify, which is what every
+    watch was before YouTube Music ones existed, so older rows need no
+    migration.
+    """
+    if providers.parse_youtube_url(url or '') is not None:
+        return SOURCE_YOUTUBE_MUSIC
+    return SOURCE_SPOTIFY
+
+
+def parse_playlist_url(url: str) -> Optional[tuple[str, str]]:
+    """``(source, playlist_id)`` for a Spotify or YouTube Music playlist URL."""
+    parsed = spotify.parse_spotify_url(url or '')
+    if parsed is not None and parsed[0] == 'playlist':
+        return SOURCE_SPOTIFY, parsed[1]
+    youtube_parsed = providers.parse_youtube_url(url or '')
+    if youtube_parsed is not None and youtube_parsed[0] == 'playlist':
+        return SOURCE_YOUTUBE_MUSIC, youtube_parsed[1]
+    return None
+
+
+def fetch_playlist(
+    source: str, playlist_id: str
+) -> tuple[str, list[dict[str, Any]]]:
+    """``(name, tracks)`` of a playlist on either service (blocking)."""
+    if source == SOURCE_YOUTUBE_MUSIC:
+        return providers.playlist_info_and_tracks_from_id(playlist_id)
+    return spotify.playlist_info_and_tracks(playlist_id)
+
+
+def fetch_playlist_cover_url(source: str, playlist_id: str) -> str:
+    """Largest playlist cover art available on either service (blocking)."""
+    if source == SOURCE_YOUTUBE_MUSIC:
+        return providers.playlist_cover_url_from_id(playlist_id)
+    return spotify.playlist_cover_url_from_id(playlist_id)
+
+
+def download_playlist_cover(
+    source: str,
+    playlist_id: str,
+    m3u_path: Path,
+    settings: dict[str, Any],
+) -> Optional[Path]:
+    """Save the playlist's cover art beside *m3u_path*, when enabled.
+
+    No-ops when ``download_cover_art_playlists`` is off. A cover
+    fetch/write failure is logged and swallowed — it must never fail
+    the playlist download itself, which has already succeeded by the
+    time this runs.
+    """
+    if not settings.get('download_cover_art_playlists'):
+        return None
+    try:
+        cover_url = fetch_playlist_cover_url(source, playlist_id)
+    except Exception:
+        logger.opt(exception=True).warning(
+            'Failed to resolve playlist cover art for {} ({})',
+            playlist_id,
+            source,
+        )
+        return None
+    if not cover_url:
+        return None
+    return save_playlist_cover(cover_url, m3u_path)
+
+
+@dataclass
+class MonitoredPlaylist:
+    id: int
+    spotify_id: str
+    name: str
+    url: str
+    interval_minutes: int
+    enabled: bool
+    last_checked: Optional[str]
+    last_track_count: int
+    created_at: str
+    # 'playlist' watches a playlist's tracks; 'artist' watches a YouTube
+    # Music artist's discography for new releases. ``spotify_id`` is just
+    # the unique key a watch is addressed by: the Spotify or YouTube Music
+    # playlist id, or for an artist the YouTube Music channel id.
+    kind: str = KIND_PLAYLIST
+    # Artist watches only: which release types to download (see
+    # :data:`RELEASE_TYPES`), and whether to skip everything the artist
+    # had already released when the watch started ("new releases only").
+    release_types: str = ALL_RELEASE_TYPES
+    new_only: bool = False
+    # Set while a "new releases only" watch still has to record the
+    # artist's current discography as already there (see check_artist).
+    baseline_pending: bool = False
+
+    @property
+    def source(self) -> str:
+        return watch_source(self.url)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data.pop('baseline_pending')
+        data['release_types'] = [t for t in self.release_types.split(',') if t]
+        return {**data, 'source': self.source}
+
+
+class PlaylistMonitorDB:
+    def __init__(self, db_path: Path) -> None:
+        self._path = str(db_path)
+        self._lock = asyncio.Lock()
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS monitored_playlists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spotify_id TEXT NOT NULL UNIQUE,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_checked TEXT,
+                    last_track_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS downloaded_tracks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    playlist_id INTEGER NOT NULL,
+                    track_spotify_id TEXT NOT NULL,
+                    downloaded_at TEXT NOT NULL,
+                    FOREIGN KEY (playlist_id) REFERENCES monitored_playlists(id)
+                        ON DELETE CASCADE,
+                    UNIQUE(playlist_id, track_spotify_id)
+                );
+                CREATE TABLE IF NOT EXISTS seen_albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    playlist_id INTEGER NOT NULL,
+                    album_id TEXT NOT NULL,
+                    name TEXT,
+                    seen_at TEXT NOT NULL,
+                    FOREIGN KEY (playlist_id) REFERENCES monitored_playlists(id)
+                        ON DELETE CASCADE,
+                    UNIQUE(playlist_id, album_id)
+                );
+            """)
+            # Migrations: artist watch options, and releases a "new
+            # releases only" watch skipped (as opposed to downloaded).
+            for statement in (
+                'ALTER TABLE monitored_playlists ADD COLUMN release_types '
+                f"TEXT NOT NULL DEFAULT '{ALL_RELEASE_TYPES}'",
+                'ALTER TABLE monitored_playlists ADD COLUMN new_only '
+                'INTEGER NOT NULL DEFAULT 0',
+                'ALTER TABLE monitored_playlists ADD COLUMN baseline_pending '
+                'INTEGER NOT NULL DEFAULT 0',
+                'ALTER TABLE seen_albums ADD COLUMN skipped '
+                'INTEGER NOT NULL DEFAULT 0',
+            ):
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
+            # Migration: add filename column if it doesn't exist yet
+            try:
+                conn.execute(
+                    'ALTER TABLE downloaded_tracks ADD COLUMN filename TEXT'
+                )
+            except Exception:
+                pass
+            # Migration: watches used to be playlists only.
+            try:
+                conn.execute(
+                    'ALTER TABLE monitored_playlists ADD COLUMN kind TEXT '
+                    f"NOT NULL DEFAULT '{KIND_PLAYLIST}'"
+                )
+            except Exception:
+                pass
+
+    def add_playlist(
+        self,
+        spotify_id: str,
+        name: str,
+        url: str,
+        interval_minutes: int = 60,
+        kind: str = KIND_PLAYLIST,
+        release_types: str = ALL_RELEASE_TYPES,
+        new_only: bool = False,
+    ) -> MonitoredPlaylist:
+        with self._connect() as conn:
+            cur = conn.execute(
+                """INSERT INTO monitored_playlists
+                   (spotify_id, name, url, interval_minutes, enabled,
+                    created_at, kind, release_types, new_only,
+                    baseline_pending)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)""",
+                (
+                    spotify_id,
+                    name,
+                    url,
+                    interval_minutes,
+                    _now_iso(),
+                    kind,
+                    release_types or ALL_RELEASE_TYPES,
+                    int(new_only),
+                    int(new_only),
+                ),
+            )
+            row = conn.execute(
+                'SELECT * FROM monitored_playlists WHERE id = ?',
+                (cur.lastrowid,),
+            ).fetchone()
+            return _row_to_playlist(row)
+
+    def list_playlists(self) -> list[MonitoredPlaylist]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT * FROM monitored_playlists ORDER BY created_at DESC'
+            ).fetchall()
+            return [_row_to_playlist(r) for r in rows]
+
+    def get_playlist(self, playlist_id: int) -> Optional[MonitoredPlaylist]:
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM monitored_playlists WHERE id = ?',
+                (playlist_id,),
+            ).fetchone()
+            return _row_to_playlist(row) if row else None
+
+    def get_by_spotify_id(
+        self, spotify_id: str
+    ) -> Optional[MonitoredPlaylist]:
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM monitored_playlists WHERE spotify_id = ?',
+                (spotify_id,),
+            ).fetchone()
+            return _row_to_playlist(row) if row else None
+
+    def delete_playlist(self, playlist_id: int) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                'DELETE FROM monitored_playlists WHERE id = ?',
+                (playlist_id,),
+            )
+            return cur.rowcount > 0
+
+    def update_playlist(
+        self, playlist_id: int, **kwargs: Any
+    ) -> Optional[MonitoredPlaylist]:
+        allowed = {
+            'interval_minutes',
+            'enabled',
+            'last_checked',
+            'last_track_count',
+            'name',
+            'url',
+            'release_types',
+            'new_only',
+            'baseline_pending',
+        }
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return self.get_playlist(playlist_id)
+        set_clause = ', '.join(f'{k} = ?' for k in updates)
+        values = list(updates.values()) + [playlist_id]
+        with self._connect() as conn:
+            conn.execute(
+                f'UPDATE monitored_playlists SET {set_clause} WHERE id = ?',
+                values,
+            )
+            row = conn.execute(
+                'SELECT * FROM monitored_playlists WHERE id = ?',
+                (playlist_id,),
+            ).fetchone()
+            return _row_to_playlist(row) if row else None
+
+    def retarget_playlist(
+        self, playlist_id: int, spotify_id: str, name: str, url: str
+    ) -> Optional[MonitoredPlaylist]:
+        """Point a watch at a different playlist or artist.
+
+        Keeps its id, interval and enabled state, but starts over like a
+        new watch: the name follows the new target, and the download and
+        release history of the old one is dropped. Files already in the
+        library stay; ones the new target shares are reused when it's
+        checked.
+        """
+        with self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE monitored_playlists
+                   SET spotify_id = ?, name = ?, url = ?,
+                       last_checked = NULL, last_track_count = 0,
+                       baseline_pending = new_only
+                   WHERE id = ?""",
+                (spotify_id, name, url, playlist_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            conn.execute(
+                'DELETE FROM downloaded_tracks WHERE playlist_id = ?',
+                (playlist_id,),
+            )
+            conn.execute(
+                'DELETE FROM seen_albums WHERE playlist_id = ?',
+                (playlist_id,),
+            )
+            row = conn.execute(
+                'SELECT * FROM monitored_playlists WHERE id = ?',
+                (playlist_id,),
+            ).fetchone()
+            return _row_to_playlist(row)
+
+    def get_track_filenames(
+        self, playlist_id: int
+    ) -> dict[str, Optional[str]]:
+        """Return ``{track_spotify_id: filename}`` for all known tracks."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT track_spotify_id, filename FROM downloaded_tracks WHERE playlist_id = ?',
+                (playlist_id,),
+            ).fetchall()
+            return {r['track_spotify_id']: r['filename'] for r in rows}
+
+    def get_seen_album_ids(self, playlist_id: int) -> set[str]:
+        """Return the album ids already processed for an artist watch."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT album_id FROM seen_albums WHERE playlist_id = ?',
+                (playlist_id,),
+            ).fetchall()
+            return {r['album_id'] for r in rows}
+
+    def mark_album_seen(
+        self,
+        playlist_id: int,
+        album_id: str,
+        name: Optional[str] = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO seen_albums
+                   (playlist_id, album_id, name, seen_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(playlist_id, album_id) DO UPDATE SET
+                   name=excluded.name, skipped=0""",
+                (playlist_id, album_id, name, _now_iso()),
+            )
+
+    def mark_albums_skipped(
+        self, playlist_id: int, albums: list[dict[str, Any]]
+    ) -> int:
+        """Record *albums* as already there when a "new releases only"
+        watch starts, without downloading them. A release that was
+        downloaded before keeps its row as is. Returns how many were
+        added."""
+
+        now = _now_iso()
+        added = 0
+        with self._connect() as conn:
+            for album in albums:
+                album_id = album.get('album_id')
+                if not album_id:
+                    continue
+                cur = conn.execute(
+                    """INSERT INTO seen_albums
+                       (playlist_id, album_id, name, seen_at, skipped)
+                       VALUES (?, ?, ?, ?, 1)
+                       ON CONFLICT(playlist_id, album_id) DO NOTHING""",
+                    (playlist_id, album_id, album.get('name'), now),
+                )
+                added += cur.rowcount
+        return added
+
+    def forget_skipped_albums(self, playlist_id: int) -> int:
+        """Drop the releases a "new releases only" watch skipped, so the
+        next check downloads them - turning the option off. Returns how
+        many."""
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                'DELETE FROM seen_albums WHERE playlist_id = ? AND skipped = 1',
+                (playlist_id,),
+            )
+            return cur.rowcount
+
+    def set_new_only(
+        self, playlist_id: int, new_only: bool
+    ) -> Optional[MonitoredPlaylist]:
+        """Turn "new releases only" on or off for an artist watch.
+
+        On: the next check records whatever the artist has released by
+        then as already there (see :func:`check_artist`), so only later
+        releases download. Off: the releases it skipped are forgotten, so
+        the next check downloads the back catalog after all.
+        """
+
+        current = self.get_playlist(playlist_id)
+        if current is None or current.new_only == new_only:
+            return current
+        if new_only:
+            return self.update_playlist(
+                playlist_id, new_only=1, baseline_pending=1
+            )
+        self.forget_skipped_albums(playlist_id)
+        return self.update_playlist(
+            playlist_id, new_only=0, baseline_pending=0
+        )
+
+    def playlists_for_track(self, track_spotify_id: str) -> set[str]:
+        """Names of the watched playlists that downloaded this track."""
+
+        tid = str(track_spotify_id or '').strip()
+        if not tid:
+            return set()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT p.name FROM downloaded_tracks dt
+                   JOIN monitored_playlists p ON p.id = dt.playlist_id
+                   WHERE dt.track_spotify_id = ?""",
+                (tid,),
+            ).fetchall()
+        return {str(row['name']) for row in rows}
+
+    def update_filename_for_spotify(
+        self, track_spotify_id: str, filename: str
+    ) -> set[str]:
+        """Point every watch's record of this track at ``filename``.
+
+        Used when the track is downloaded again elsewhere (another
+        playlist, a single download), so a watch doesn't keep a stale
+        path. Returns the playlists that have the track.
+        """
+
+        tid = str(track_spotify_id or '').strip()
+        name = str(filename or '').strip().replace('\\', '/')
+        if not tid or not name:
+            return set()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE downloaded_tracks SET filename = ?
+                   WHERE track_spotify_id = ?
+                   AND (filename IS NULL OR filename != ?)""",
+                (name, tid, name),
+            )
+        return self.playlists_for_track(tid)
+
+    def mark_track_downloaded(
+        self,
+        playlist_id: int,
+        track_spotify_id: str,
+        filename: Optional[str] = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO downloaded_tracks
+                   (playlist_id, track_spotify_id, downloaded_at, filename)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(playlist_id, track_spotify_id) DO UPDATE SET
+                   downloaded_at=excluded.downloaded_at,
+                   filename=excluded.filename""",
+                (playlist_id, track_spotify_id, _now_iso(), filename),
+            )
+
+    def list_all_downloaded_tracks(self) -> list[dict[str, Any]]:
+        """Every ``downloaded_tracks`` row that has a filename, across
+        every watch.
+
+        Used by the hourly reconciliation sweep (see
+        :func:`reconcile_downloaded_tracks`), which checks all of them
+        against the filesystem in one pass instead of one watch at a
+        time.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT playlist_id, track_spotify_id, filename
+                   FROM downloaded_tracks
+                   WHERE filename IS NOT NULL"""
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def remove_downloaded_tracks(self, pairs: list[tuple[int, str]]) -> int:
+        """Delete the given ``(playlist_id, track_spotify_id)`` rows.
+
+        Called when the hourly reconciliation sweep finds a downloaded
+        track's file is no longer under the downloads directory — the
+        track goes back to being "not downloaded" and is re-fetched on
+        the watch's next check.
+        """
+        if not pairs:
+            return 0
+        with self._connect() as conn:
+            conn.executemany(
+                """DELETE FROM downloaded_tracks
+                   WHERE playlist_id = ? AND track_spotify_id = ?""",
+                pairs,
+            )
+        return len(pairs)
+
+
+def _row_to_playlist(row: sqlite3.Row) -> MonitoredPlaylist:
+    keys = row.keys()
+    return MonitoredPlaylist(
+        id=row['id'],
+        spotify_id=row['spotify_id'],
+        name=row['name'],
+        url=row['url'],
+        interval_minutes=row['interval_minutes'],
+        enabled=bool(row['enabled']),
+        last_checked=row['last_checked'],
+        last_track_count=row['last_track_count'],
+        created_at=row['created_at'],
+        # Rows written before the kind migration have no column at all
+        # when reading from a stale connection/schema cache.
+        kind=(row['kind'] if 'kind' in keys else KIND_PLAYLIST)
+        or KIND_PLAYLIST,
+        release_types=(row['release_types'] if 'release_types' in keys else '')
+        or ALL_RELEASE_TYPES,
+        new_only=bool(row['new_only']) if 'new_only' in keys else False,
+        baseline_pending=(
+            bool(row['baseline_pending'])
+            if 'baseline_pending' in keys
+            else False
+        ),
+    )
+
+
+async def _fill_from_spotify_track(song: dict[str, Any]) -> None:
+    """Top up a Spotify playlist row from the track's own embed.
+
+    Playlist embed entries are missing release year and use the playlist
+    cover instead of the album cover; the per-track embed has both. The
+    playlist values stay as a fallback if the per-track fetch fails.
+    """
+    try:
+        full = await asyncio.to_thread(spotify.track_from_id, song['song_id'])
+    except Exception:
+        logger.opt(exception=True).warning(
+            'Per-track Spotify fetch failed for {}; '
+            'falling back to playlist data',
+            song['song_id'],
+        )
+        return
+    for key in ('cover_url', 'year', 'release_date', 'album_name', 'artists'):
+        value = full.get(key)
+        if value:
+            song[key] = value
+    for key in ('track_number', 'album_track_total'):
+        if not song.get(key) and full.get(key):
+            song[key] = full[key]
+
+
+async def check_playlist(
+    playlist: MonitoredPlaylist,
+    db: PlaylistMonitorDB,
+    downloader: Downloader,
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+    settings: Optional[dict[str, Any]] = None,
+    library: Optional[LibraryStores] = None,
+) -> int:
+    """Fetch playlist, detect new tracks, download them. Returns count downloaded.
+
+    With ``library`` stores, new tracks already in the library (by Spotify
+    id, when *Overwrite existing files* is off) are linked instead of
+    downloaded, every downloaded track is registered in them, and the
+    playlist's catalog and Navidrome playlist are synced after the sweep.
+    """
+    logger.info(
+        'Checking monitored playlist "{}" ({})',
+        playlist.name,
+        playlist.spotify_id,
+    )
+
+    from_spotify = playlist.source == SOURCE_SPOTIFY
+    fetch_tracks = (
+        spotify.playlist_tracks_from_id
+        if from_spotify
+        else providers.playlist_tracks_from_id
+    )
+    try:
+        tracks = await asyncio.to_thread(fetch_tracks, playlist.spotify_id)
+    except Exception:
+        logger.exception('Failed to fetch playlist {}', playlist.spotify_id)
+        await asyncio.to_thread(
+            db.update_playlist, playlist.id, last_checked=_now_iso()
+        )
+        return 0
+    library = library or LibraryStores()
+    if from_spotify and library.playlist_spotify_cache is not None:
+        await asyncio.to_thread(
+            library.playlist_spotify_cache.store,
+            playlist.spotify_id,
+            playlist.name,
+            tracks,
+        )
+    if library.playlist_catalog is not None:
+        await asyncio.to_thread(
+            library.playlist_catalog.ensure_playlist,
+            playlist.name,
+            spotify_id=_catalog_spotify_id(playlist),
+        )
+
+    known_tracks = await asyncio.to_thread(db.get_track_filenames, playlist.id)
+
+    pl_subdir = m3u.sanitize_playlist_name(playlist.name)
+
+    # Filenames already known from earlier sweeps, keyed by track id,
+    # topped up as each new track lands. Lets the M3U be rewritten after
+    # every single download without re-resolving the whole playlist
+    # against the filesystem each time (which is O(tracks) globs per
+    # write, and quadratic over a large sweep).
+    #
+    # A track already in `downloaded_tracks` is trusted as downloaded
+    # without checking whether its file is still on disk — the file may
+    # have been moved elsewhere in the filesystem outside the downloads
+    # directory (e.g. into a separate media library), which must not
+    # cause a re-download on every single sweep. A file that's actually
+    # gone (deleted, not just moved) is instead noticed and forgotten by
+    # the hourly :func:`reconcile_downloaded_tracks` sweep, which is what
+    # makes such a track eligible for re-download again.
+    resolved: dict[str, str] = {}
+
+    new_tracks, linked_from_library = await _split_new_tracks(
+        playlist, tracks, db, downloader, library, known_tracks, resolved
+    )
+
+    if new_tracks:
+        logger.info(
+            'Found {} track(s) to download in playlist "{}"',
+            len(new_tracks),
+            playlist.name,
+        )
+        if settings is None or settings.get('generate_m3u', True):
+            # Once per sweep, and before the tracks — a sweep that finds
+            # nothing new never re-fetches it.
+            await asyncio.to_thread(
+                _download_cover_for_watch, playlist, downloader, settings or {}
+            )
+
+    delay_seconds = (settings or {}).get('download_delay_seconds', 0) or 0
+    track_positions = {id(t): i for i, t in enumerate(tracks)}
+
+    downloaded = 0
+    for index, song in enumerate(new_tracks):
+        track_id = song['song_id']
+        pl_name = playlist.name
+
+        # YouTube Music rows already carry their own video's metadata.
+        if from_spotify:
+            await _fill_from_spotify_track(song)
+
+        def _make_cb(s: dict, name: str) -> ProgressCallback:
+            return _progress_cb(s, name, broadcast, loop)
+
+        try:
+            filename = await loop.run_in_executor(
+                DOWNLOAD_EXECUTOR,
+                lambda s=song: downloader.download(
+                    s, _make_cb(s, pl_name), subdir=pl_subdir
+                ),
+            )
+            await asyncio.to_thread(
+                db.mark_track_downloaded, playlist.id, track_id, filename
+            )
+            invalidate_library_paths_cache()
+            downloaded += 1
+            if filename:
+                resolved[track_id] = filename
+                await asyncio.to_thread(
+                    _register_monitored_download,
+                    song,
+                    filename,
+                    downloader,
+                    library,
+                    settings or {},
+                    playlist_name=playlist.name,
+                    track_order=track_positions[id(song)],
+                )
+            if settings is None or settings.get('generate_m3u', True):
+                # Rewrite the M3U after every track rather than once the
+                # whole sweep finishes, so the playlist grows as it
+                # downloads and a slow/hung track further down the list
+                # never holds up what's already on disk.
+                await asyncio.to_thread(
+                    _regenerate_m3u, playlist, tracks, downloader, resolved
+                )
+            if delay_seconds > 0 and index != len(new_tracks) - 1:
+                await asyncio.sleep(delay_seconds)
+        except Exception:
+            logger.exception('Failed to auto-download track {}', track_id)
+
+    await asyncio.to_thread(
+        db.update_playlist,
+        playlist.id,
+        last_checked=_now_iso(),
+        last_track_count=len(tracks),
+    )
+
+    if downloaded > 0 or linked_from_library > 0:
+        known_tracks = await asyncio.to_thread(
+            db.get_track_filenames, playlist.id
+        )
+        if settings is None or settings.get('generate_m3u', True):
+            await asyncio.to_thread(
+                _regenerate_m3u,
+                playlist,
+                tracks,
+                downloader,
+                None,
+                known_tracks,
+            )
+        await asyncio.to_thread(
+            _sync_library_playlist,
+            playlist,
+            tracks,
+            downloader,
+            known_tracks,
+            library,
+            settings,
+        )
+    return downloaded
+
+
+def _catalog_spotify_id(playlist: MonitoredPlaylist) -> Optional[str]:
+    """The playlist catalog keys playlists by Spotify id; a YouTube Music
+    watch has none."""
+
+    return playlist.spotify_id if playlist.source == SOURCE_SPOTIFY else None
+
+
+async def _split_new_tracks(
+    playlist: MonitoredPlaylist,
+    tracks: list[dict[str, Any]],
+    db: PlaylistMonitorDB,
+    downloader: Downloader,
+    library: LibraryStores,
+    known_tracks: dict[str, Optional[str]],
+    resolved: dict[str, str],
+) -> tuple[list[dict[str, Any]], int]:
+    """``(tracks to download, number linked from the library)``.
+
+    Tracks the watch already recorded are skipped (and their filenames
+    added to ``resolved``). With *Overwrite existing files* off, a new
+    track the track index already has on disk is recorded for the watch
+    instead of being downloaded again.
+    """
+
+    new_tracks: list[dict[str, Any]] = []
+    linked = 0
+    link_existing = library.track_index is not None and not getattr(
+        downloader, 'overwrite_existing_files', True
+    )
+    for track in tracks:
+        tid = track.get('song_id')
+        if not tid:
+            continue
+        if tid in known_tracks:
+            stored = known_tracks[tid]
+            if stored is not None:
+                resolved[tid] = stored
+            continue
+        existing = (
+            await asyncio.to_thread(
+                _library_file_for, track, downloader, library
+            )
+            if link_existing
+            else None
+        )
+        if not existing:
+            new_tracks.append(track)
+            continue
+        await asyncio.to_thread(
+            db.mark_track_downloaded, playlist.id, tid, existing
+        )
+        resolved[tid] = existing
+        linked += 1
+    if linked:
+        logger.info(
+            'Linked {} track(s) already in the library into playlist "{}"',
+            linked,
+            playlist.name,
+        )
+    return new_tracks, linked
+
+
+def _library_file_for(
+    song: dict[str, Any], downloader: Downloader, library: LibraryStores
+) -> Optional[str]:
+    """The library path already holding ``song`` per the track index."""
+
+    tid = normalize_spotify_track_id(song)
+    if not tid or library.track_index is None:
+        return None
+    stored = library.track_index.lookup(tid)
+    if not stored:
+        return None
+    if locate_library_file(
+        stored, downloader.download_dir, slskd_dir_from_downloader(downloader)
+    ):
+        return stored
+    library.track_index.forget(tid)
+    return None
+
+
+def _register_monitored_download(
+    song: dict[str, Any],
+    filename: str,
+    downloader: Downloader,
+    library: LibraryStores,
+    settings: dict[str, Any],
+    *,
+    playlist_name: str,
+    track_order: int,
+) -> None:
+    """Record a track a sweep downloaded in the library stores."""
+
+    download_dir = Path(downloader.download_dir)
+    slskd_dir = slskd_dir_from_downloader(downloader)
+    full = locate_library_file(filename, download_dir, slskd_dir)
+    if full is None:
+        return
+    try:
+        if library.track_index is not None:
+            library.track_index.register_song(song, filename, full_path=full)
+        if library.playlist_catalog is not None:
+            library.playlist_catalog.upsert_track(
+                playlist_name, song, filename, full, track_order=track_order
+            )
+        if library.navidrome_index is not None:
+            cache_navidrome_song_id(
+                settings,
+                song,
+                filename,
+                library.navidrome_index,
+                download_dir=download_dir,
+                slskd_dir=slskd_dir,
+            )
+        if library.metadata_cache is not None:
+            library.metadata_cache.refresh_stored_path(
+                filename, download_dir=download_dir, slskd_dir=slskd_dir
+            )
+        if settings.get('cache_cover_art') and library.cover_cache:
+            library.cover_cache.refresh_stored_path(
+                filename, download_dir=download_dir, slskd_dir=slskd_dir
+            )
+    except Exception:
+        logger.exception('Could not register {} in the library', filename)
+
+
+def _sync_library_playlist(
+    playlist: MonitoredPlaylist,
+    tracks: list[dict[str, Any]],
+    downloader: Downloader,
+    known_tracks: dict[str, Optional[str]],
+    library: LibraryStores,
+    settings: Optional[dict[str, Any]],
+) -> None:
+    """After a sweep: mirror the playlist's on-disk tracks into the
+    catalog and, when Navidrome sync is on, update its Navidrome playlist."""
+
+    download_dir = Path(downloader.download_dir)
+    slskd_dir = slskd_dir_from_downloader(downloader)
+    rows: list[tuple[dict[str, Any], str, Path]] = []
+    for song in tracks:
+        filename = known_tracks.get(song.get('song_id') or '')
+        full = (
+            locate_library_file(filename, download_dir, slskd_dir)
+            if filename
+            else None
+        )
+        if full is not None:
+            rows.append((song, filename, full))
+
+    if library.playlist_catalog is not None and rows:
+        try:
+            library.playlist_catalog.replace_playlist_tracks(
+                playlist.name, rows, spotify_id=_catalog_spotify_id(playlist)
+            )
+        except Exception:
+            logger.exception(
+                'Playlist catalog sync failed for "{}"', playlist.name
+            )
+
+    if (
+        not settings
+        or settings.get('sync_navidrome', True) is False
+        or not _effective_navidrome_settings(settings).get('enabled')
+    ):
+        return
+    songs = [
+        enrich_song_from_library_file(
+            {**song, 'filename': filename}, download_dir, slskd_dir
+        )
+        for song, filename, _full in rows
+    ]
+    if not songs:
+        logger.warning(
+            'Navidrome sync skip for "{}": no tracks on disk', playlist.name
+        )
+        return
+    try:
+        sync_playlist_to_navidrome(
+            playlist.name,
+            songs,
+            settings,
+            navidrome_index=library.navidrome_index,
+            download_dir=download_dir,
+        )
+    except Exception:
+        logger.exception('Navidrome sync failed for "{}"', playlist.name)
+
+
+def _progress_cb(
+    song: dict[str, Any],
+    label: str,
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+) -> ProgressCallback:
+    """Build a downloader progress callback that broadcasts over the WS."""
+
+    def _cb(pct: float, message: str, provider: Optional[str] = None) -> None:
+        asyncio.run_coroutine_threadsafe(
+            broadcast({
+                'song': song,
+                'progress': pct,
+                'message': message,
+                'provider': provider or '',
+                'playlist_name': label,
+            }),
+            loop,
+        )
+
+    return _cb
+
+
+async def check_artist(
+    playlist: MonitoredPlaylist,
+    db: PlaylistMonitorDB,
+    downloader: Downloader,
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+    settings: Optional[dict[str, Any]] = None,
+) -> int:
+    """Download every release of a watched artist that isn't known yet.
+
+    ``playlist.spotify_id`` is the artist's YouTube Music channel id. The
+    discography is listed in one call per sweep; only releases missing
+    from ``seen_albums`` have their tracklists fetched, so a steady-state
+    sweep costs a single request. Returns the number of tracks
+    downloaded.
+
+    Only releases of the watch's ``release_types`` are downloaded; one of
+    another type is left unmarked, so turning that type on later picks it
+    up. A "new releases only" watch first records everything already out
+    as skipped (``baseline_pending``) and downloads nothing that sweep -
+    but only once the discography actually came back non-empty, since an
+    empty answer is as likely a YouTube Music hiccup as an artist with no
+    releases, and taking it at face value would download the whole back
+    catalog on the next sweep.
+    """
+    logger.info(
+        'Checking monitored artist "{}" ({})',
+        playlist.name,
+        playlist.spotify_id,
+    )
+
+    try:
+        albums = await asyncio.to_thread(
+            providers.artist_albums_from_channel_id, playlist.spotify_id
+        )
+    except Exception:
+        logger.exception(
+            'Failed to fetch discography for artist {}', playlist.spotify_id
+        )
+        await asyncio.to_thread(
+            db.update_playlist, playlist.id, last_checked=_now_iso()
+        )
+        return 0
+
+    if playlist.baseline_pending:
+        if not albums:
+            logger.info(
+                'Artist "{}": no releases listed yet; will record the '
+                'existing ones on the next check',
+                playlist.name,
+            )
+            await asyncio.to_thread(
+                db.update_playlist, playlist.id, last_checked=_now_iso()
+            )
+            return 0
+        skipped = await asyncio.to_thread(
+            db.mark_albums_skipped, playlist.id, albums
+        )
+        logger.info(
+            'Artist "{}" watches new releases only: {} existing release(s) '
+            'skipped',
+            playlist.name,
+            skipped,
+        )
+        await asyncio.to_thread(
+            db.update_playlist,
+            playlist.id,
+            baseline_pending=0,
+            last_checked=_now_iso(),
+            last_track_count=len(albums),
+        )
+        return 0
+
+    wanted_types = set(
+        (playlist.release_types or ALL_RELEASE_TYPES).split(',')
+    )
+    seen = await asyncio.to_thread(db.get_seen_album_ids, playlist.id)
+    new_albums = [
+        a
+        for a in albums
+        if a.get('album_id')
+        and a['album_id'] not in seen
+        and release_type_of(a) in wanted_types
+    ]
+    if new_albums:
+        logger.info(
+            'Found {} new release(s) for artist "{}"',
+            len(new_albums),
+            playlist.name,
+        )
+
+    delay_seconds = (settings or {}).get('download_delay_seconds', 0) or 0
+    known_tracks = await asyncio.to_thread(db.get_track_filenames, playlist.id)
+
+    downloaded = 0
+    for album in new_albums:
+        album_id = album['album_id']
+        try:
+            tracks = await asyncio.to_thread(
+                providers.album_tracks_from_browse_id, album_id
+            )
+        except Exception:
+            logger.exception(
+                'Failed to fetch tracks for release {} ({})',
+                album.get('name'),
+                album_id,
+            )
+            continue
+
+        complete = True
+        for song in tracks:
+            track_id = song.get('song_id')
+            if not track_id:
+                complete = False
+                continue
+            if track_id in known_tracks:
+                continue
+            try:
+                filename = await loop.run_in_executor(
+                    DOWNLOAD_EXECUTOR,
+                    lambda s=song: downloader.download(
+                        s, _progress_cb(s, playlist.name, broadcast, loop)
+                    ),
+                )
+                await asyncio.to_thread(
+                    db.mark_track_downloaded, playlist.id, track_id, filename
+                )
+                invalidate_library_paths_cache()
+                known_tracks[track_id] = filename
+                downloaded += 1
+                if delay_seconds > 0:
+                    await asyncio.sleep(delay_seconds)
+            except Exception:
+                complete = False
+                logger.exception(
+                    'Failed to auto-download track {} of release {}',
+                    track_id,
+                    album.get('name'),
+                )
+
+        # Only remember the release once every track is accounted for, so
+        # a transient failure is retried on the next sweep instead of
+        # being silently skipped forever. Tracks that already succeeded
+        # are cheap to skip via `known_tracks`.
+        if complete:
+            await asyncio.to_thread(
+                db.mark_album_seen, playlist.id, album_id, album.get('name')
+            )
+
+    await asyncio.to_thread(
+        db.update_playlist,
+        playlist.id,
+        last_checked=_now_iso(),
+        last_track_count=len(albums),
+    )
+    return downloaded
+
+
+def _regenerate_m3u(
+    playlist: MonitoredPlaylist,
+    tracks: list[dict[str, Any]],
+    downloader: Downloader,
+    resolved: Optional[dict[str, str]] = None,
+    known_tracks: Optional[dict[str, Optional[str]]] = None,
+) -> Optional[Path]:
+    """Rewrite the playlist's M3U, in playlist order. Returns its path,
+    or ``None`` when nothing was written.
+
+    Walks the full ordered track list (not just the freshly downloaded
+    ones) and hands the entries to :func:`m3u.write_m3u`. Tracks with no
+    file are dropped, so a partially-downloaded playlist still yields a
+    valid, correctly-ordered M3U.
+
+    With *resolved* (``{track_id: filename}``) filenames are taken from
+    that map alone — the cheap path used for the rewrite after each
+    individual download. Without it every track is resolved against the
+    filesystem instead, which is the authoritative view used for the
+    final rewrite at the end of a sweep: the watch's recorded filename
+    (``known_tracks``) when that file exists — it may be a track linked
+    from elsewhere in the library, e.g. an slskd download — else the
+    track's expected path in the playlist folder.
+    """
+
+    pl_subdir = m3u.sanitize_playlist_name(playlist.name)
+    download_dir = Path(downloader.download_dir)
+    slskd_dir = slskd_dir_from_downloader(downloader)
+    entries: list[dict[str, Any]] = []
+    for song in tracks:
+        if resolved is not None:
+            filename = resolved.get(song.get('song_id') or '')
+        else:
+            filename = (known_tracks or {}).get(song.get('song_id') or '')
+            if not (
+                filename
+                and locate_library_file(filename, download_dir, slskd_dir)
+            ):
+                filename = downloader.existing_filename_for(
+                    song, subdir=pl_subdir
+                )
+        if not filename:
+            continue
+        entries.append({
+            'filename': filename,
+            'title': song.get('name', ''),
+            'artist': ', '.join(song.get('artists') or []),
+            'duration': song.get('duration', 0),
+        })
+    if not entries:
+        logger.warning(
+            'M3U skip for monitored playlist "{}": no tracks on disk',
+            playlist.name,
+        )
+        return None
+    # When organize-by-artist/album is on the tracks live in those folders
+    # rather than the per-playlist subfolder, so the M3U goes to the legacy
+    # Playlists/ directory where its relative paths still resolve.
+    organize = downloader.organize_by_artist or downloader.organize_by_album
+    path, _kept = m3u.write_m3u(
+        downloader.download_dir,
+        playlist.name,
+        entries,
+        playlist_subdir=None if organize else pl_subdir,
+        slskd_dir=slskd_dir,
+    )
+    return path
+
+
+def _download_cover_for_watch(
+    playlist: MonitoredPlaylist,
+    downloader: Downloader,
+    settings: dict[str, Any],
+) -> Optional[Path]:
+    """Save a watched playlist's cover where its M3U lives.
+
+    Called once per sweep that has tracks to fetch, before the first of
+    them — the path is resolved from the playlist's name rather than
+    read back from a written M3U, so the artwork is in place while the
+    folder fills up.
+    """
+
+    organize = downloader.organize_by_artist or downloader.organize_by_album
+    pl_subdir = m3u.sanitize_playlist_name(playlist.name)
+    m3u_path = m3u.m3u_path_for(
+        downloader.download_dir,
+        playlist.name,
+        playlist_subdir=None if organize else pl_subdir,
+    )
+    return download_playlist_cover(
+        playlist.source, playlist.spotify_id, m3u_path, settings
+    )
+
+
+# Ids of watches with a check running right now. Adding a watch starts its
+# first check immediately, and the background sweep would otherwise start
+# a second one for the same never-checked watch while the first is still
+# downloading — both then fetch the same tracks into the same files.
+_checks_running: set[int] = set()
+
+
+async def check_podcast_watch(
+    playlist: MonitoredPlaylist,
+    db: PlaylistMonitorDB,
+    podcasts: PodcastStore,
+    download_dir: Path,
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+) -> int:
+    """Sync one podcast watch: ``playlist.spotify_id`` is its feed URL.
+
+    Only the scheduling row lives here; the show itself, its retention
+    policy and its episodes are ``podcasts.py``'s job — this is just the
+    glue ``check_watch`` needs to treat a podcast like any other kind of
+    watch. Returns the number of episodes downloaded.
+    """
+
+    show = await asyncio.to_thread(
+        podcasts.get_show_by_feed_url, playlist.spotify_id
+    )
+    if show is None:
+        logger.warning(
+            'Podcast watch "{}" has no matching show row (feed {})',
+            playlist.name,
+            playlist.spotify_id,
+        )
+        await asyncio.to_thread(
+            db.update_playlist, playlist.id, last_checked=_now_iso()
+        )
+        return 0
+
+    def _progress(info: dict[str, Any]) -> None:
+        asyncio.run_coroutine_threadsafe(
+            broadcast({'type': 'podcast_progress', **info}), loop
+        )
+
+    try:
+        count = await asyncio.to_thread(
+            sync_show, podcasts, show, download_dir, progress=_progress
+        )
+    except Exception:
+        logger.exception('Podcast sync failed for "{}"', playlist.name)
+        count = 0
+    await asyncio.to_thread(
+        db.update_playlist, playlist.id, last_checked=_now_iso()
+    )
+    if count:
+        asyncio.run_coroutine_threadsafe(broadcast({'type': 'podcasts'}), loop)
+    return count
+
+
+async def check_watch(
+    playlist: MonitoredPlaylist,
+    db: PlaylistMonitorDB,
+    downloader: Downloader,
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+    settings: Optional[dict[str, Any]] = None,
+    library: Optional[LibraryStores] = None,
+    podcasts: Optional[PodcastStore] = None,
+) -> int:
+    """Run the right check for a watch by kind, unless one is already running."""
+    if playlist.id in _checks_running:
+        logger.info('Watch "{}" is already being checked', playlist.name)
+        return 0
+    _checks_running.add(playlist.id)
+    try:
+        if playlist.kind == KIND_PODCAST:
+            if podcasts is None:
+                logger.warning(
+                    'Podcast watch "{}" but podcast store not ready',
+                    playlist.name,
+                )
+                return 0
+            return await check_podcast_watch(
+                playlist,
+                db,
+                podcasts,
+                Path(downloader.download_dir),
+                broadcast,
+                loop,
+            )
+        if playlist.kind == KIND_ARTIST:
+            return await check_artist(
+                playlist, db, downloader, broadcast, loop, settings
+            )
+        return await check_playlist(
+            playlist, db, downloader, broadcast, loop, settings, library
+        )
+    finally:
+        _checks_running.discard(playlist.id)
+
+
+async def monitor_loop(
+    db: PlaylistMonitorDB,
+    get_downloader: Callable[[], Optional[Downloader]],
+    broadcast: Callable[[dict[str, Any]], Any],
+    loop: asyncio.AbstractEventLoop,
+    settings: Optional[dict[str, Any]] = None,
+    get_library: Optional[Callable[[], LibraryStores]] = None,
+    get_podcasts: Optional[Callable[[], Optional[PodcastStore]]] = None,
+) -> None:
+    """Background task: sweep all enabled playlists that are due for checking."""
+    while True:
+        try:
+            playlists = await asyncio.to_thread(db.list_playlists)
+            for pl in playlists:
+                if not pl.enabled:
+                    continue
+                if not _is_due(pl.last_checked, pl.interval_minutes):
+                    continue
+                downloader = get_downloader()
+                if downloader is None:
+                    continue
+                try:
+                    count = await check_watch(
+                        pl,
+                        db,
+                        downloader,
+                        broadcast,
+                        loop,
+                        settings,
+                        get_library() if get_library else None,
+                        get_podcasts() if get_podcasts else None,
+                    )
+                    if count > 0:
+                        logger.info(
+                            'Auto-downloaded {} new track(s) from "{}"',
+                            count,
+                            pl.name,
+                        )
+                except Exception:
+                    logger.exception(
+                        'Error while checking watch "{}"', pl.name
+                    )
+        except Exception:
+            logger.exception('Unexpected error in monitor loop')
+        await asyncio.sleep(MONITOR_LOOP_INTERVAL)
+
+
+async def reconcile_downloaded_tracks(
+    db: PlaylistMonitorDB, downloader: Downloader
+) -> int:
+    """Drop ``downloaded_tracks`` rows whose file is gone from disk.
+
+    ``check_playlist`` trusts a row in ``downloaded_tracks`` as proof a
+    track was already downloaded without re-checking the filesystem (see
+    its docstring) — otherwise a file moved elsewhere on disk would be
+    re-downloaded on every single sweep. This is the other half of that
+    trade-off: a track whose file has genuinely disappeared (deleted,
+    not just moved) is still noticed here and forgotten, so it becomes
+    eligible for re-download again on the watch's next check. Returns
+    the number of rows removed.
+    """
+    rows = await asyncio.to_thread(db.list_all_downloaded_tracks)
+    # One stat() per downloaded track — thousands of them on a slow disk
+    # or network mount — so off the event loop.
+    missing = await asyncio.to_thread(
+        lambda: [
+            (row['playlist_id'], row['track_spotify_id'])
+            for row in rows
+            if not (downloader.download_dir / row['filename']).exists()
+        ]
+    )
+    if missing:
+        await asyncio.to_thread(db.remove_downloaded_tracks, missing)
+    return len(missing)
+
+
+async def reconcile_loop(
+    db: PlaylistMonitorDB,
+    get_downloader: Callable[[], Optional[Downloader]],
+    interval_seconds: int = RECONCILE_LOOP_INTERVAL,
+) -> None:
+    """Background task: hourly, prune downloaded-track records for files
+    that are no longer in the downloads directory.
+
+    Runs independently of :func:`monitor_loop` and its per-watch
+    schedule — this sweep always checks every known downloaded track
+    across every watch, on its own fixed cadence.
+    """
+    while True:
+        try:
+            downloader = get_downloader()
+            if downloader is not None:
+                removed = await reconcile_downloaded_tracks(db, downloader)
+                if removed:
+                    logger.info(
+                        '{} downloaded-track record(s) removed: file no '
+                        'longer found in the downloads directory',
+                        removed,
+                    )
+        except Exception:
+            logger.exception('Unexpected error in reconcile loop')
+        await asyncio.sleep(interval_seconds)

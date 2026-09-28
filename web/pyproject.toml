@@ -1,0 +1,61 @@
+[project]
+name = "downtify"
+version = "3.1.0"
+description = "Download your Spotify playlists and songs along with album art and metadata in a self-hosted way via Docker"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "fastapi>=0.139.1",
+    "feedparser>=6.0.14",
+    "httpx>=0.28.1",
+    "load-dotenv>=0.1.0",
+    "loguru>=0.7.3",
+    "mutagen>=1.48.1",
+    "uvicorn>=0.52.4",
+    "websockets>=17.1",
+    "yt-dlp>=2026.8.19",
+    "ytmusicapi>=1.12.2",
+    "zeroconf>=0.147",
+]
+
+[dependency-groups]
+dev = [
+    "codeflash>=0.20.6",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.uv]
+upgrade = true
+
+[tool.ruff]
+line-length = 79
+# Design-canvas generator scripts (design/), not shipped code.
+extend-exclude = ['design']
+
+[tool.ruff.lint]
+preview = true
+select = ['I', 'F', 'E', 'W', 'PL', 'PT']
+extend-ignore = [
+    'PLW0717',
+]
+
+[tool.ruff.format]
+preview = true
+quote-style = 'single'
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["E501", "PLR0915", "PLR2004", "PLR1702", "PLR0912", "PLR0911"]
+"downloader.py" = ["PLC1901"]
+"downtify/*.py" = ["E501", "PLR0913", "PLR0917", "PLR2004", "PLW0603", "PLR0911", "PLR0915", "PLR0912", "PLR0916"]
+"tests/*.py" = ["PLR2004", "PLC2701", "E501"]
+
+[tool.codeflash]
+# All paths are relative to this pyproject.toml's directory.
+module-root = "downtify"
+tests-root = "tests"
+ignore-paths = []
+formatter-cmds = ["ruff check --exit-zero --fix $file", "ruff format $file"]

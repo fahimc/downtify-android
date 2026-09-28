@@ -1,0 +1,17 @@
+.github
+.venv
+.gitignore
+.python-version
+README.md
+.env
+.ruff_cache/
+.git/
+__pycache__
+*.pyc
+.mypy_cache
+.vscode
+frontend/node_modules
+frontend/dist
+docs/node_modules
+docs/.vitepress/cache
+docs/.vitepress/dist
