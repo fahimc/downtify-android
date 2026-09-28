@@ -156,7 +156,8 @@ const library = useLibrary()
 const player = usePlayer()
 const actions = useTrackActions()
 const playlistActions = usePlaylistActions()
-const native = globalThis.window?.DowntifyNative
+const bridge = globalThis.window?.DowntifyNative
+const native = bridge && (!bridge.supportsNativePlayback || bridge.supportsNativePlayback()) ? bridge : null
 
 const playlist = computed(() =>
   library.findPlaylist(String(route.query.name || ''))

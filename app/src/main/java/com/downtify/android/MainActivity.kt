@@ -25,6 +25,7 @@ import java.net.URL
 import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
+    private data class ServerConnection(val id: String, val token: String, val name: String, val legacyWeb: Boolean = false)
     private lateinit var config: ServerConfig
     private lateinit var web: WebView
     private lateinit var root: LinearLayout
@@ -50,7 +51,18 @@ class MainActivity : AppCompatActivity() {
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val u = request.url.toString(); return !(u.startsWith("https://appassets.androidplatform.net/") || u.startsWith(config.url))
+                    val uri = request.url
+                    val appAssets = uri.host == "appassets.androidplatform.net"
+                    val server = runCatching { android.net.Uri.parse(config.url) }.getOrNull()
+                    val sameServer = server != null && uri.scheme == server.scheme && uri.host == server.host && uri.port == server.port
+                    return !(appAssets || sameServer)
+                }
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                    if (request.isForMainFrame && config.legacyWeb && request.url.host == android.net.Uri.parse(config.url).host) {
+                        view.stopLoading()
+                        view.loadUrl("https://appassets.androidplatform.net/index.html")
+                        Toast.makeText(this@MainActivity, "Server unavailable. Showing bundled offline UI.", Toast.LENGTH_LONG).show()
+                    }
                 }
             }
         }
@@ -81,13 +93,27 @@ class MainActivity : AppCompatActivity() {
             val result = withContext(Dispatchers.IO) { runCatching {
                 val client = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build()
                 val infoRequest = Request.Builder().url("$normalized/api/server/info").header("Accept", "application/json").build()
-                val serverInfo = client.newCall(infoRequest).execute().use { response ->
+                val infoResponse = client.newCall(infoRequest).execute().use { response ->
                     val body = response.body?.string().orEmpty()
                     if (!response.isSuccessful) error(httpError("Server check", response.code, body, response.header("Content-Type")))
                     try { JSONObject(body) } catch (_: Exception) {
-                        error(htmlError("Server check", body, response.header("Content-Type")))
+                        null
                     }
                 }
+                if (infoResponse == null) {
+                    val versionRequest = Request.Builder().url("$normalized/api/version").header("Accept", "application/json").build()
+                    val version = client.newCall(versionRequest).execute().use { response ->
+                        val body = response.body?.string().orEmpty()
+                        if (!response.isSuccessful) error(htmlError("Server check", body, response.header("Content-Type")))
+                        body.trim().removeSurrounding("\"").trim().takeIf { it.isNotBlank() }
+                            ?: error(htmlError("Server check", body, response.header("Content-Type")))
+                    }
+                    if (!Regex("^\\d+\\.\\d+\\.\\d+").containsMatchIn(version)) error(htmlError("Server version check", version, "application/json"))
+                    if (isMobileApiVersion(version)) error("Downtify $version did not return its mobile server-info response. Check that /api/server/info is forwarded by the reverse proxy.")
+                    if (pairCode.isNotBlank()) error("Downtify $version predates mobile pairing. Leave the pairing code blank to open its web interface, or update the server to 3.2.0 or newer.")
+                    return@runCatching ServerConnection("legacy:$normalized", "", "Downtify $version", true)
+                }
+                val serverInfo = infoResponse
                 require(serverInfo.optString("product") == "Downtify") { "This URL is not a Downtify server." }
                 require(serverInfo.optInt("api_version") <= 1) { "This server API is newer than this app supports." }
                 val serverId = serverInfo.optString("server_id")
@@ -101,9 +127,9 @@ class MainActivity : AppCompatActivity() {
                         try { JSONObject(bodyText).getString("token") } catch (_: Exception) { error(htmlError("Pairing", bodyText, response.header("Content-Type"))) }
                     }
                 }
-                Triple(serverId, token, serverInfo.optString("name", "Downtify"))
+                ServerConnection(serverId, token, serverInfo.optString("name", "Downtify"))
             } }
-            result.onSuccess { (id, token, name) -> config.url = normalized; config.serverId = id; config.token = token; pendingServerUrl = ""; pendingPairCode = ""; status.text = name; loadWeb() }
+            result.onSuccess { connection -> config.url = normalized; config.serverId = connection.id; config.token = connection.token; config.legacyWeb = connection.legacyWeb; pendingServerUrl = ""; pendingPairCode = ""; status.text = connection.name; loadWeb(); if (connection.legacyWeb) Toast.makeText(this@MainActivity,"Connected in web mode. Update Downtify to 3.2.0+ for native pairing and offline playback.",Toast.LENGTH_LONG).show() }
                 .onFailure { status.text = "Downtify"; showConnect(it.message ?: "Couldn't reach this server. Check the address and network, then try again.") }
         }
     }
@@ -120,7 +146,17 @@ class MainActivity : AppCompatActivity() {
         }
         return "$operation returned an invalid response. Confirm this is a compatible Downtify server."
     }
-    private fun loadWeb() { status.text = "Downtify"; web.loadUrl("https://appassets.androidplatform.net/index.html") }
+    private fun isMobileApiVersion(version: String): Boolean {
+        val match = Regex("^(\\d+)\\.(\\d+)\\.(\\d+)").find(version) ?: return false
+        val found = match.groupValues.drop(1).map { it.toIntOrNull() ?: 0 }
+        val required = listOf(3, 2, 0)
+        for (i in required.indices) if (found[i] != required[i]) return found[i] > required[i]
+        return true
+    }
+    private fun loadWeb() {
+        status.text = if (config.legacyWeb) "Downtify · web mode" else "Downtify"
+        if (config.legacyWeb) web.loadUrl(config.url) else web.loadUrl("https://appassets.androidplatform.net/index.html")
+    }
     private fun showOffline() {
         lifecycleScope.launch {
             val tracks = AppDatabase.get(this@MainActivity).tracks().all()
@@ -141,7 +177,8 @@ class MainActivity : AppCompatActivity() {
 
     inner class NativeBridge(private val activity: MainActivity) {
         @JavascriptInterface fun getServerUrl() = config.url
-        @JavascriptInterface fun getToken() = config.token
+        @JavascriptInterface fun getToken() = if (config.legacyWeb) "" else config.token
+        @JavascriptInterface fun supportsNativePlayback() = !config.legacyWeb
         @JavascriptInterface fun setServerUrl(url: String) { runOnUiThread { showConnect() } }
         @JavascriptInterface fun downloadTrack(trackJson: String) {
             val t = runCatching { JSONObject(trackJson) }.getOrNull() ?: return
@@ -164,6 +201,7 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { Toast.makeText(activity,"$count downloads queued",Toast.LENGTH_SHORT).show() }
         }
         @JavascriptInterface fun resolveTrackId(file: String): String {
+            if (config.legacyWeb) return ""
             return runCatching {
                 val cached = trackIds[file]; if (cached != null) return cached
                 val request = Request.Builder().url("${config.url}/api/v1/library?since=0").header("Authorization","Bearer ${config.token}").build()

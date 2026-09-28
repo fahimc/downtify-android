@@ -57,7 +57,8 @@ import { useI18n } from '/src/i18n'
 const player = usePlayer()
 const { t, locale } = useI18n()
 const track = computed(() => player.currentTrack.value)
-const native = globalThis.window?.DowntifyNative
+const bridge = globalThis.window?.DowntifyNative
+const native = bridge && (!bridge.supportsNativePlayback || bridge.supportsNativePlayback()) ? bridge : null
 
 const rows = computed(() => {
   const tr = track.value

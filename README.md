@@ -2,6 +2,8 @@
 
 An Android companion for a self-hosted Downtify server. The app bundles the upstream Vue web interface and adds native device pairing, Media3 background playback, and private offline downloads. The upstream frontend source lives in [`web/frontend`](web/frontend); a small adapter routes its API requests through the selected server and hands music playback to Android.
 
+Servers on Downtify 3.1.x open their own web interface in compatibility mode. Native pairing, downloads and Media3 playback require Downtify 3.2.0 or newer.
+
 ## Current implementation
 
 - Server URL setup and Downtify API identity check (`/api/server/info`).

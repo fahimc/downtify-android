@@ -66,6 +66,11 @@ let shufflePos = 0
 let sleepTimer = null
 let restoreTime = 0
 
+function hasNativePlayback() {
+  const bridge = window.DowntifyNative
+  return Boolean(bridge && (!bridge.supportsNativePlayback || bridge.supportsNativePlayback()))
+}
+
 function ensureAudio() {
   if (audio) return audio
   audio = new Audio()
@@ -308,7 +313,7 @@ function playAt(index) {
     shuffleVersion.value += 1
   }
   playError.value = ''
-  if (window.DowntifyNative) {
+  if (hasNativePlayback()) {
     const track = playlist.value[index]
     const id = track.id || track.track_id || window.DowntifyNative.resolveTrackId(track.file)
     window.DowntifyNative.play(JSON.stringify({
@@ -349,7 +354,7 @@ function play() {
 }
 
 function pause() {
-  if (window.DowntifyNative) {
+  if (hasNativePlayback()) {
     window.DowntifyNative.pause()
     isPlaying.value = false
     return
@@ -363,7 +368,7 @@ function toggle() {
 }
 
 function seek(seconds) {
-  if (window.DowntifyNative) {
+  if (hasNativePlayback()) {
     window.DowntifyNative.seek(Math.round(seconds * 1000))
     currentTime.value = seconds
     return

@@ -1,0 +1,1 @@
+import{E as e,I as t}from"./vendor-CPi3g9k7.js";import{y as n}from"./index-C7Eq3a5R.js";var r={},i={class:`animate-pulse rounded-control bg-surface-2`,"aria-hidden":`true`};function a(n,r){return t(),e(`div`,i)}var o=n(r,[[`render`,a]]);export{o as t};

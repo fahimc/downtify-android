@@ -4,6 +4,8 @@
 
 The initial handshake calls `GET /api/server/info`, validates `product == Downtify` and rejects unknown newer API versions. Pairing uses `POST /api/auth/pair` with the server's one-time pairing code, device model and `platform: android`. Authenticated requests use the returned bearer device token. That is the server-supported device credential, so the app never asks for the account password.
 
+For older Downtify 3.1.x servers, `/api/server/info` does not exist and the single-page web app returns HTML for that path. The app probes `GET /api/version`; if the server is older than 3.2.0, it loads the server's own root page in the WebView so the existing home UI and same-origin sign-in work. Native pairing/playback/download features remain available only on servers exposing the 3.2 mobile contract.
+
 The Vue API adapter uses the user-configured server origin, and its Axios requests add the native bearer token. The upstream mobile API provides durable track IDs, incremental sync, playlist and likes endpoints, range streaming, covers and WebSocket events. Since the upstream `/tracks` rows use filenames, the bridge resolves a row's ID through `/api/v1/library?since=0` and caches the filename-to-ID mapping for later playback and downloads.
 
 ## Web/native bridge

@@ -125,7 +125,8 @@ const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const library = useLibrary()
-const native = globalThis.window?.DowntifyNative
+const bridge = globalThis.window?.DowntifyNative
+const native = bridge && (!bridge.supportsNativePlayback || bridge.supportsNativePlayback()) ? bridge : null
 const player = usePlayer()
 const actions = useTrackActions()
 
