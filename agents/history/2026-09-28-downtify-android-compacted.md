@@ -17,3 +17,9 @@ Standalone Android client repository at `C:/Projects/downtify-android`. Upstream
 - Library incremental sync, artwork download/cache, saved playback-position updates, persisted progress/status and retry presentation, foreground long-running download behavior, and fuller Offline browsing need implementation.
 - Rebuild embedded web assets after frontend edits: `npm --prefix web/frontend ci`, `npm --prefix web/frontend run build`, `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stage-web.ps1`; then `gradlew.bat --no-daemon assembleDebug assembleRelease`.
 - Release signing uses the debug signing config and must be changed before publishing.
+
+## Follow-up: connection response diagnostics (2026-09-28)
+
+The user-provided screenshot showed `JSONObject` receiving a body starting with `<!doctype`, proving the server-info request returned HTML and the parser leaked its exception. Updated setup to check HTTP status/content type, report likely root-path/proxy interception causes, and retain the URL/pair code after a failed attempt. Version is now 0.1.1.
+
+Verification: `assembleDebug assembleRelease` succeeds. Installed debug APK 0.1.1 on connected Moto G31 (Android 12) through Appium. Entered `https://example.com`; UI showed a useful HTTP 404/HTML diagnostic and preserved the URL. Deleted Appium session and force-stopped app afterward. User's actual Downtify URL is not present in the screenshot, so live server compatibility remains unverified pending the server root URL.

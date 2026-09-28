@@ -29,6 +29,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var web: WebView
     private lateinit var root: LinearLayout
     private lateinit var status: TextView
+    private var pendingServerUrl = ""
+    private var pendingPairCode = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -57,27 +59,35 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun button(text: String, action: () -> Unit) = Button(this).apply { this.text = text; setOnClickListener { action() } }
-    private fun showConnect() {
+    private fun showConnect(error: String? = null) {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 8, 32, 0) }
-        val server = EditText(this).apply { hint = "https://music.example.com"; setSingleLine(); setText(config.url) }
-        val code = EditText(this).apply { hint = "Pairing code (optional)"; setSingleLine() }
+        val server = EditText(this).apply { hint = "https://music.example.com"; setSingleLine(); setText(config.url.ifBlank { pendingServerUrl }) }
+        val code = EditText(this).apply { hint = "Pairing code (optional)"; setSingleLine(); setText(pendingPairCode) }
         box.addView(TextView(this).apply { text = "Downtify Server"; textSize = 20f }); box.addView(server); box.addView(code)
-        AlertDialog.Builder(this).setTitle("Connect to Downtify").setView(box)
+        AlertDialog.Builder(this).setTitle("Connect to Downtify").apply { if (!error.isNullOrBlank()) setMessage(error) }.setView(box)
             .setPositiveButton("Connect") { _, _ -> connect(server.text.toString(), code.text.toString()) }
             .setNegativeButton("Cancel", null).show()
     }
     private fun connect(raw: String, pairCode: String) {
         val normalized = raw.trim().trimEnd('/')
+        pendingServerUrl = normalized
+        pendingPairCode = pairCode
         val parsed = runCatching { URL(normalized) }.getOrNull()
         if (parsed == null || parsed.protocol !in listOf("https", "http") || (parsed.protocol == "http" && parsed.host !in listOf("localhost", "127.0.0.1", "10.0.2.2") && !parsed.host.startsWith("192.168."))) {
-            Toast.makeText(this, "Enter an HTTPS server URL (HTTP is allowed on a local network).", Toast.LENGTH_LONG).show(); showConnect(); return
+            showConnect("Enter the Downtify server's root HTTPS URL. HTTP is accepted for localhost and 192.168.x.x addresses."); return
         }
         status.text = "Connecting…"
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching {
                 val client = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build()
-                val info = client.newCall(Request.Builder().url("$normalized/api/server/info").build()).execute().use { it.body!!.string() }
-                val serverInfo = JSONObject(info)
+                val infoRequest = Request.Builder().url("$normalized/api/server/info").header("Accept", "application/json").build()
+                val serverInfo = client.newCall(infoRequest).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) error(httpError("Server check", response.code, body, response.header("Content-Type")))
+                    try { JSONObject(body) } catch (_: Exception) {
+                        error(htmlError("Server check", body, response.header("Content-Type")))
+                    }
+                }
                 require(serverInfo.optString("product") == "Downtify") { "This URL is not a Downtify server." }
                 require(serverInfo.optInt("api_version") <= 1) { "This server API is newer than this app supports." }
                 val serverId = serverInfo.optString("server_id")
@@ -85,13 +95,30 @@ class MainActivity : AppCompatActivity() {
                 if (pairCode.isNotBlank()) {
                     val body = JSONObject().put("code", pairCode).put("device_name", android.os.Build.MODEL).put("platform", "android")
                     val req = Request.Builder().url("$normalized/api/auth/pair").post(body.toString().toRequestBody("application/json".toMediaType())).build()
-                    token = client.newCall(req).execute().use { response -> if (!response.isSuccessful) error("Pairing failed (${response.code}). Check the code and try again."); JSONObject(response.body!!.string()).getString("token") }
+                    token = client.newCall(req).execute().use { response ->
+                        val bodyText = response.body?.string().orEmpty()
+                        if (!response.isSuccessful) error(httpError("Pairing", response.code, bodyText, response.header("Content-Type")))
+                        try { JSONObject(bodyText).getString("token") } catch (_: Exception) { error(htmlError("Pairing", bodyText, response.header("Content-Type"))) }
+                    }
                 }
                 Triple(serverId, token, serverInfo.optString("name", "Downtify"))
             } }
-            result.onSuccess { (id, token, name) -> config.url = normalized; config.serverId = id; config.token = token; status.text = name; loadWeb() }
-                .onFailure { status.text = "Downtify"; Toast.makeText(this@MainActivity, it.message ?: "Server unavailable", Toast.LENGTH_LONG).show(); showConnect() }
+            result.onSuccess { (id, token, name) -> config.url = normalized; config.serverId = id; config.token = token; pendingServerUrl = ""; pendingPairCode = ""; status.text = name; loadWeb() }
+                .onFailure { status.text = "Downtify"; showConnect(it.message ?: "Couldn't reach this server. Check the address and network, then try again.") }
         }
+    }
+    private fun httpError(operation: String, code: Int, body: String, contentType: String?): String {
+        val detail = runCatching { JSONObject(body).optString("detail") }.getOrDefault("")
+        if (contentType?.contains("text/html", ignoreCase = true) == true || body.trimStart().startsWith("<!doctype", true) || body.trimStart().startsWith("<html", true)) {
+            return "$operation returned an HTML page (HTTP $code), not Downtify's API response. Check that you entered the server root URL and that any Cloudflare Access or reverse proxy allows /api/server/info."
+        }
+        return "$operation failed (HTTP $code)${if (detail.isNotBlank()) ": $detail" else ". Check the server URL and try again."}"
+    }
+    private fun htmlError(operation: String, body: String, contentType: String?): String {
+        if (contentType?.contains("text/html", ignoreCase = true) == true || body.trimStart().startsWith("<!doctype", true) || body.trimStart().startsWith("<html", true)) {
+            return "$operation received an HTML page instead of Downtify JSON. Check the server root URL and whether Cloudflare Access or a reverse proxy is intercepting /api requests."
+        }
+        return "$operation returned an invalid response. Confirm this is a compatible Downtify server."
     }
     private fun loadWeb() { status.text = "Downtify"; web.loadUrl("https://appassets.androidplatform.net/index.html") }
     private fun showOffline() {
