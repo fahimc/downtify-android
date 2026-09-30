@@ -22,7 +22,7 @@ WorkManager downloads into `files/music/<server_id>/` and stores metadata in Roo
 
 ## Online/offline switching
 
-The bundled web UI is loaded from APK assets and can render while offline. Compatibility servers use their remote interface while connected; **More → Offline music** remains available for locally saved tracks. Local files remain in app storage when the server is unreachable or its token is revoked. Selecting an offline-library row always opens its private local file through Media3. A 3.2 remote play request prefers a matching local track. Changing to a different server identity scopes future lookup and downloads to the new server ID.
+Startup displays a native local downloads screen before any network request. With no active internet-capable network it stays on that screen; otherwise an eight-second server reachability check precedes loading the web interface. Main-frame network/HTTP failures and a twelve-second page-load timeout return to the local screen. This fallback does not depend on the bundled Vue app bootstrapping successfully or on server API calls. Compatibility servers use their remote interface while connected; **More → Offline music** remains available for locally saved tracks. Local files remain in app storage when the server is unreachable or its token is revoked. Selecting an offline-library row always opens its private local file through Media3 using the row's server identity. A 3.2 remote play request prefers a matching local track. Changing to a different server identity scopes future lookup and downloads to the new server ID.
 
 ## Current limits
 

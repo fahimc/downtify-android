@@ -17,6 +17,8 @@ Servers on Downtify 3.1.x open their own web interface in compatibility mode. In
 
 To save a track on Downtify 3.1.x, open the track's three-dot menu and tap **Save to this device**. Open **More → Offline music** to browse and play saved tracks. See [BUILD.md](BUILD.md) for build commands and [ARCHITECTURE.md](ARCHITECTURE.md) for integration details and current limits. On Downtify 3.2.0 or newer, pair the phone from Downtify's **Settings → Apps → Pair a phone**, then enter the displayed code in the Android app.
 
+When started without a connection, the app opens a local **Offline music** screen immediately. Tap a saved track to play it, or **Reconnect to server** when your connection returns. Server failures and loading timeouts also return to this screen. No server response or web assets are needed to browse the local list.
+
 ## Upstream
 
 The bundled web source is based on [henriquesebastiao/downtify](https://github.com/henriquesebastiao/downtify) (GPL-3.0). `web/UPSTREAM.md` records the source revision and local adapter changes.

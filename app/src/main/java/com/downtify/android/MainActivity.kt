@@ -4,6 +4,11 @@ import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.os.Bundle
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
 import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
@@ -14,6 +19,7 @@ import com.downtify.android.downloads.TrackDownloadWorker
 import com.downtify.android.playback.PlaybackController
 import com.downtify.android.playback.PlaybackService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -30,6 +36,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var web: WebView
     private var pendingServerUrl = ""
     private var pendingPairCode = ""
+    private val loadHandler = Handler(Looper.getMainLooper())
+    private val loadTimeout = Runnable { showOfflineHome("Server took too long to respond. Your downloads are available below.") }
+    private var showingOffline = false
+    private var connectionJob: Job? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,6 +53,7 @@ class MainActivity : AppCompatActivity() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
                 override fun onPageFinished(view: WebView, url: String) {
                     super.onPageFinished(view, url)
+                    loadHandler.removeCallbacks(loadTimeout)
                     installNativeMenu(view)
                 }
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -53,11 +64,10 @@ class MainActivity : AppCompatActivity() {
                     return !(appAssets || sameServer)
                 }
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
-                    if (request.isForMainFrame && config.legacyWeb && request.url.host == android.net.Uri.parse(config.url).host) {
-                        view.stopLoading()
-                        view.loadUrl("https://appassets.androidplatform.net/index.html")
-                        Toast.makeText(this@MainActivity, "Server unavailable. Showing bundled offline UI.", Toast.LENGTH_LONG).show()
-                    }
+                    if (request.isForMainFrame && !showingOffline) showOfflineHome("Server unavailable. Your downloads are available below.")
+                }
+                override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+                    if (request.isForMainFrame && !showingOffline) showOfflineHome("Server returned HTTP ${errorResponse.statusCode}. Your downloads are available below.")
                 }
             }
             setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
@@ -193,7 +203,74 @@ class MainActivity : AppCompatActivity() {
         return true
     }
     private fun loadWeb() {
-        if (config.legacyWeb) web.loadUrl(config.url) else web.loadUrl("https://appassets.androidplatform.net/index.html")
+        connectionJob?.cancel()
+        showOfflineHome("Connecting to your server…")
+        val network = getSystemService(ConnectivityManager::class.java)
+        val capabilities = network.getNetworkCapabilities(network.activeNetwork)
+        if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) != true) {
+            showOfflineHome("You're offline. Your downloaded music is ready to play.")
+            return
+        }
+        connectionJob = lifecycleScope.launch {
+            val reachable = withContext(Dispatchers.IO) {
+                runCatching {
+                    OkHttpClient.Builder().callTimeout(8, TimeUnit.SECONDS).build()
+                        .newCall(Request.Builder().url(config.url).build()).execute().use { it.isSuccessful }
+                }.getOrDefault(false)
+            }
+            if (!reachable) {
+                showOfflineHome("Server unavailable. Your downloads are available below.")
+                return@launch
+            }
+            showingOffline = false
+            setContentView(web)
+            web.setBackgroundColor(Color.rgb(10, 11, 13))
+            loadHandler.postDelayed(loadTimeout, 12000)
+            if (config.legacyWeb) web.loadUrl(config.url) else web.loadUrl("https://appassets.androidplatform.net/index.html")
+        }
+    }
+    private fun showOfflineHome(message: String) {
+        showingOffline = true
+        loadHandler.removeCallbacks(loadTimeout)
+        web.stopLoading()
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 32, 32, 32)
+            setBackgroundColor(Color.rgb(10, 11, 13))
+        }
+        fun label(value: String, size: Float) = TextView(this).apply {
+            text = value; textSize = size; setTextColor(Color.WHITE); setPadding(0, 16, 0, 16)
+        }
+        content.addView(label("Offline music", 28f))
+        content.addView(label(message, 16f))
+        fun action(title: String, onClick: () -> Unit) = Button(this).apply {
+            text = title; isAllCaps = false; setTextColor(Color.rgb(20, 210, 95))
+            backgroundTintList = android.content.res.ColorStateList.valueOf(Color.rgb(25, 27, 31))
+            setOnClickListener { onClick() }
+        }
+        content.addView(action("Reconnect to server") { loadWeb() })
+        content.addView(action("Server settings") { showConnect() })
+        content.addView(action("Pause playback") { PlaybackController.pause(this) })
+        content.addView(action("Download settings") { downloadSettings() })
+        val scroll = ScrollView(this).apply { setBackgroundColor(Color.rgb(10, 11, 13)); addView(content) }
+        setContentView(scroll)
+        lifecycleScope.launch {
+            val tracks = AppDatabase.get(this@MainActivity).tracks().all().filter { java.io.File(it.localFilePath).exists() }
+            content.addView(label("${tracks.size} downloaded ${if (tracks.size == 1) "track" else "tracks"}", 18f))
+            if (tracks.isEmpty()) content.addView(label("Connect to your server and use Save to this device on a track to keep it offline.", 16f))
+            tracks.forEach { track ->
+                content.addView(action("▶ ${track.title}\n${track.artist}") {
+                    NativeBridge(this@MainActivity).play(JSONObject().put("id", track.trackId).put("serverId", track.serverId)
+                        .put("title", track.title).put("artist", track.artist).put("album", track.album).toString())
+                    Toast.makeText(this@MainActivity, "Playing ${track.title} from device", Toast.LENGTH_SHORT).show()
+                })
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        loadHandler.removeCallbacks(loadTimeout)
+        super.onDestroy()
     }
     private fun showOffline() {
         lifecycleScope.launch {
@@ -265,7 +342,7 @@ class MainActivity : AppCompatActivity() {
                     val file = row.optString("file")
                     val id = row.optString("id").ifBlank { row.optString("track_id").ifBlank { withContext(Dispatchers.IO) { resolveTrackId(file) } } }
                     if (id.isBlank()) continue
-                    val local = AppDatabase.get(activity).tracks().find(config.serverId,id)?.takeIf { java.io.File(it.localFilePath).exists() }
+                    val local = AppDatabase.get(activity).tracks().find(row.optString("serverId", config.serverId),id)?.takeIf { java.io.File(it.localFilePath).exists() }
                     val quality = config.quality
                     val suffix = if (quality == "original") "" else "?format=${quality.substringBefore('/')}&bitrate=${quality.substringAfter('/', "160")}"
                     val uri = local?.localFilePath ?: "${config.url}/api/v1/tracks/$id/stream$suffix"
